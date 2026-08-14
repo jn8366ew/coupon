@@ -406,6 +406,16 @@ Kafka 는 반대다. **메시지가 남는다.** 그래서 이제 위험은 유�
 `KafkaAdmin` 도 없어서 `KafkaTopicConfig` 가 죽은 코드였고(토픽은 브로커 auto-create 로 생겼다,
 DLT 는 아예 없었다), `KafkaConfig` 에 `KafkaAdmin` 빈을 직접 만들어 살렸다.
 
+**PowerShell 에서 컨테이너 로그를 한글로 검색하면 안 잡힌다.** `docker compose logs` 의
+UTF-8 출력을 콘솔이 CP949 로 읽어 `諛쒓툒 湲곕줉...` 처럼 깨지므로,
+`Select-String '재고 보상'` 이 **빈 결과**를 낸다. 로그가 없는 것이 아니라 화면이 깨진 것인데,
+**정상 동작을 실패로 읽게 되는 자리다** (실제로 한 번 그럴 뻔했다).
+
+```powershell
+docker compose logs coupon-service | Select-String 'IssuanceCompensator'   # ASCII 로 찾는다
+[Console]::OutputEncoding=[Text.Encoding]::UTF8                            # 또는 인코딩을 맞춘다 (그 세션 한정)
+```
+
 **새로 만드는 `.ps1` 에는 UTF-8 BOM 을 붙인다.** PowerShell 5.1 은 BOM 이 없으면 파일을
 시스템 코드페이지(한국어 Windows 면 CP949)로 읽어 한글 주석이 깨지고, 운이 나쁘면
 따옴표가 어긋나 **파싱 에러**가 난다. 기존 스크립트가 전부 BOM 을 달고 있는 이유다.
