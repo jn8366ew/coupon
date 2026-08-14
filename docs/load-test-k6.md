@@ -750,22 +750,38 @@ lua-pool : 141,023 전달 +  8,978 버림 → 94%   (duplicate 는 98%)
 카운터로 따로 센다. **여기서 말하는 p99 는 "앱이 실제로 응답한 요청의 p99"** 이고,
 `status_conn_error` 가 크면 그만큼 살아남은 요청만 본 수치라는 뜻이므로 같이 읽어야 한다.
 
+**threshold 판정은 k6 의 종료 코드로 하지 않는다.** `queue-mem` 실행이 p(99)=5.62ms,
+**최댓값 46.59ms** 로 어떤 시점에도 500ms 를 넘길 수 없는데 `thresholds have been crossed` 를
+찍고 exit 99 로 끝난 적이 있다. **원인은 모른다.** `issue_latency` 의 `min` 이 음수로 찍히는 것
+(컨테이너 클럭 문제로 보인다)을 의심했지만 아니었다 — 음수가 섞였는데 exit 0 인 실행도 있다.
+
+요약 JSON 의 `metrics.issue_latency.thresholds` 가 실제 판정이다 (`true` = 넘김, `false` = 통과).
+`run.ps1` 이 그것을 읽어 출력하고, 종료 코드와 어긋나면 그 사실을 알린다.
+
 ### 13.3 결과
 
-`lua-pool`(동기 쓰기) vs `queue-mem`(인메모리 큐 + 워커), 둘 다 본 측정 라운드.
+셋 다 본 측정 라운드. `lua-pool` 은 동기 쓰기, 뒤 둘은 큐 뒤로 뺀 쓰기다.
 
-| | `lua-pool` | **`queue-mem`** |
-|---|---:|---:|
-| `issue_latency` p(99) | 705ms | **5.61ms** |
-| avg | 27.51ms | 1.39ms |
-| med | 531µs | 1.23ms |
-| 성공 응답 p(99) `{expected_response:true}` | 1.03s | **43.28ms** |
-| `http_reqs` (의도 150,000) | 145,707 | **150,001** |
-| `dropped_iterations` | 2,259 | **0** |
-| `vus_max` (상한 5,000) | 3,073 | **2,000** |
-| `status_conn_error` | 0 | 0 |
-| checks | 100% | 100% |
-| 정확성 / Redis 재고 | OK / 누수 0 | OK / 누수 0 |
+| | `lua-pool` | **`queue-mem`** | `queue-async` |
+|---|---:|---:|---:|
+| `issue_latency` p(99) | 705ms | **5.62ms** | 5.59ms |
+| avg | 27.51ms | 1.40ms | 1.43ms |
+| med | 531µs | 1.23ms | 1.25ms |
+| 성공 응답 p(99) `{expected_response:true}` | 1.03s | **43.28ms** | 35.80ms |
+| `http_reqs` (의도 150,000) | 145,707 | **150,001** | 150,002 |
+| `dropped_iterations` | 2,259 | **0** | 0 |
+| `vus_max` (상한 5,000) | 3,073 | **2,000** | 2,000 |
+| `status_conn_error` | 0 | 0 | 0 |
+| checks | 100% | 100% | 100% |
+| 정확성 / Redis 재고 | OK / 누수 0 | OK / 누수 0 | OK / 누수 0 |
+
+`queue-async` 는 직접 만든 큐·워커를 Spring `ApplicationEventPublisher` + `@Async` 로 바꾼 것인데
+**수치가 사실상 같다.** 풀 설정이 `corePoolSize=1, queueCapacity=10_000` 이라 앞 구현과 특성이
+동일하기 때문이다 — 단일 컨슈머, 용량 10,000. 쓰기 드레인도 초당 약 155행으로 같다.
+**프레임워크로 갈아끼운 것은 코드가 줄어든 것이지 성능이 달라진 것이 아니다.**
+병목이 큐가 아니라 그 뒤에 있다는 13.5 의 진단이 이것으로 한 번 더 확인된다.
+
+이하 서술은 `lua-pool` → `queue-mem` 비교를 기준으로 한다 (`queue-async` 도 같은 결론이다).
 
 **p99 가 125배 낮아졌다.** 그리고 이 표에서 더 중요한 것은 아래 두 줄이다.
 

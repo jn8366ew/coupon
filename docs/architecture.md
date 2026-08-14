@@ -52,10 +52,9 @@ CouponController.issue
        ├─ coupon.isBookingOpen(now)          시작 전이면 NOT_STARTED
        ├─ couponIssuer.tryIssue              Redis Lua — 발급 자격 판정이 여기서 원자적으로 끝난다
        │                                       SOLD_OUT / ALREADY_ISSUED 는 여기서 예외로 끝
-       └─ issuanceQueue.enqueue              인메모리 큐에 넣고 곧바로 200 을 반환한다
-                                               큐가 꽉 차면 QUEUE_FULL (503)
+       └─ eventPublisher.publishEvent        이벤트만 던지고 곧바로 200 을 반환한다
 
-  ⤷ InMemoryIssuanceWorker — 데몬 스레드 1개가 큐를 계속 비운다
+  ⤷ IssuanceEventHandler — @Async @EventListener, 전용 스레드 풀 1개가 큐를 비운다
        └─ IssuanceWriter.write                UNIQUE 위반은 멱등 처리로 삼키고 넘어간다
             └─ IssuanceTransactionWriter.insertAndIncrement   @Transactional
                  ├─ issuanceRepository.save                     INSERT issuance
@@ -66,6 +65,12 @@ CouponController.issue
 경합이 몰리는 자리(재고 차감, 1인 1매)는 전부 Redis 의 Lua 스크립트 안에 있고,
 DB 쓰기는 응답 경로에서 빠져 있다. 그래서 사용자 응답 p99 가 705ms → 5.61ms 가 됐다
 ([`load-test-k6.md` §13.3](load-test-k6.md)).
+
+큐는 `AsyncIssuanceConfig` 의 `ThreadPoolTaskExecutor` 안에 있다
+(`corePoolSize=1, maxPoolSize=1, queueCapacity=10_000`).
+**큐가 꽉 차면 500 이 나간다** — 예전 `QueueFullException`(503)은 없어졌고,
+`ThreadPoolTaskExecutor` 의 기본 거부 정책이 `AbortPolicy` 라 `TaskRejectedException` 이 뜬다.
+게이트 통과가 5,000 이고 용량이 10,000 이라 정상 조건에서는 닿지 않는다.
 
 **중요한 것은 200 OK 가 "발급 완료" 가 아니라 "접수 완료" 라는 점이다.** 응답 본문의
 `id` 는 아직 저장 전이라 `null` 이고, 실제 행은 워커가 나중에 쓴다. 5,000건을 다 쓰는 데
@@ -101,10 +106,10 @@ src/main/kotlin/com/example/coupon/
     IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
     IssuanceService.kt          사용/조회
   infrastructure/messaging/
-    InMemoryIssuanceQueue.kt    LinkedBlockingQueue(용량 10,000). 꽉 차면 QUEUE_FULL
-    IssuanceRequested.kt        큐에 실리는 이벤트 (couponId, userId, 발급/만료 시각)
-    InMemoryIssuanceWorker.kt   데몬 스레드 1개. @PostConstruct 로 뜨고 큐를 계속 비운다
-    IssuanceWriter.kt           워커의 쓰기 진입점. UNIQUE 위반을 멱등 처리로 삼킨다
+    AsyncIssuanceConfig.kt      전용 ThreadPoolTaskExecutor (스레드 1, 큐 10,000)
+    IssuanceRequested.kt        발행되는 이벤트 (couponId, userId, 발급/만료 시각)
+    IssuanceEventHandler.kt     @Async @EventListener — 그 풀에서 write 를 호출한다
+    IssuanceWriter.kt           쓰기 진입점. UNIQUE 위반을 멱등 처리로 삼킨다
     IssuanceTransactionWriter.kt  실제 @Transactional 경계. INSERT + 카운터 UPDATE
   domain/
     Coupon.kt                   재고 총량 + 발급 카운터
@@ -187,7 +192,8 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤 DB 쓰기가 실패해도 저�
 | `lua-gate` | Lua 게이트를 DB 접근 **앞으로** | 위와 같음 | OK | ~252/s |
 | `lua-wb` | Lua 게이트가 맨 앞 | 동기 INSERT, 카운터는 write-behind | OK | ~2,700/s |
 | `lua-pool` | 위와 같음 | 위와 같음 (Hikari 풀 10 → 50) | OK | ~4,000/s |
-| **`queue-mem` (현재)** | 게이트가 DB 조회 **뒤로** 돌아옴 | **인메모리 큐 + 워커 1개 (비동기)** | OK | **응답 5,000/s · 쓰기 ~155/s** |
+| `queue-mem` | 게이트가 DB 조회 **뒤로** 돌아옴 | **인메모리 큐 + 워커 1개 (비동기)** | OK | 응답 5,000/s · 쓰기 ~155/s |
+| **`queue-async` (현재)** | 위와 같음 | 위와 같음, 단 Spring `@Async` + 이벤트로 | OK | **응답 5,000/s · 쓰기 ~155/s** |
 
 `pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있다.
 
@@ -198,7 +204,11 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 **경합 지점을 DB 밖으로 빼는 것이 Lua 의 값어치인데, DB 쪽 경합을 같이 없애지 않으면
 복잡도만 늘고 이득이 없다.**
 
-`queue-mem` 의 처리량 칸이 둘로 갈라진 것이 이 구현의 성격을 그대로 말한다.
+`queue-async` 는 직접 만든 큐·워커를 Spring 기능으로 갈아끼운 것인데 **수치가 사실상 같다**
+(p99 5.62 → 5.59ms). 풀 설정이 앞 구현과 특성이 같으니 그렇다.
+**프레임워크로 옮긴 것은 코드가 줄어든 것이지 성능이 달라진 것이 아니다.**
+
+처리량 칸이 둘로 갈라진 것이 이 두 구현의 성격을 그대로 말한다.
 사용자 응답은 부하 상한(5,000/s)을 그대로 소화하는데 DB 쓰기는 초당 155건이다.
 **큐는 병목을 없앤 것이 아니라 사용자 응답 밖으로 옮겼다.** 워커가 단일 스레드인 데다
 `incrementIssueQuantity`(= `coupon` 단일 행 UPDATE)가 워커 안으로 되돌아온 탓이다 —
@@ -335,6 +345,13 @@ docker compose exec redis redis-cli GET coupon:1:stock
 그러면 큐가 비워지는 데다 워밍업으로 데운 JVM 도 식는다. 스크립트가 끝에 컨테이너 ID 를
 대조해 재생성 여부를 알려준다.
 
+**k6 의 종료 코드로 threshold 를 판정하지 않는다.** p(99)=5.62ms, 최댓값 46.59ms 인 실행이
+`thresholds have been crossed` 를 찍고 exit 99 로 끝난 적이 있다. 그 분포로는 어떤 시점에도
+500ms 를 넘길 수 없으므로 종료 코드 쪽이 틀린 것이다 (원인 미확정). 판정은 요약 JSON 의
+`metrics.issue_latency.thresholds` 로 한다 (`true` = 넘김, `false` = 통과).
+`response/windows/run.ps1` 이 그것을 읽어 출력하고 종료 코드와 어긋나면 알려준다
+→ [`load-test-k6.md` §13.2](load-test-k6.md)
+
 **새로 만드는 `.ps1` 에는 UTF-8 BOM 을 붙인다.** PowerShell 5.1 은 BOM 이 없으면 파일을
 시스템 코드페이지(한국어 Windows 면 CP949)로 읽어 한글 주석이 깨지고, 운이 나쁘면
 따옴표가 어긋나 **파싱 에러**가 난다. 기존 스크립트가 전부 BOM 을 달고 있는 이유다.
@@ -365,7 +382,7 @@ Docker 가 **빈 디렉터리를 만들어 주기 때문에** 에러가 아니�
 | naive / pessimistic / lua / lua-gate | `coupon` 단일 행 UPDATE 의 직렬화 | ~290건/초 |
 | lua-wb | Hikari 커넥션 풀 기본값 10개 | ~2,700건/초 |
 | lua-pool | **미확정.** Tomcat 스레드 200개가 용의자였다 | ~4,000건/초 |
-| **queue-mem (현재)** | **응답 경로에는 없다.** 부하 상한에 먼저 걸린다 | **5,000건/초 (부하 상한)** |
+| **queue-mem / queue-async (현재)** | **응답 경로에는 없다.** 부하 상한에 먼저 걸린다 | **5,000건/초 (부하 상한)** |
 | " | 대신 **워커의 DB 쓰기** 가 새 병목이다 | **~155건/초** |
 
 행 락을 없애자 커넥션 수가, 커넥션을 늘리자 그 다음이 드러났고,
