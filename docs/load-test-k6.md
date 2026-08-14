@@ -993,7 +993,8 @@ UPDATE 로 확정되고, 안 오르면 커밋당 fsync 가 상한이라 다음 �
 - **재시도 1초 × 3회는 그 파티션을 통째로 멈춘다.** 순서를 보장하려면 실패한 레코드를
   넘어갈 수 없다. 실패가 하나 나면 드레인이 그만큼 주저앉는다
 - **파티션이 3개로 고정이다.** 컨슈머를 4 이상으로 올려도 하나는 논다.
-  `KafkaTopicConfig` 의 `partitions(3)` 이 병렬도의 상한이다
+  (`kafka` ~ `kafka-nocount` 시점에는 이 3이 `KafkaTopicConfig` 가 아니라
+  `docker-compose.yml` 의 `KAFKA_NUM_PARTITIONS: 3` 에서 왔다 — 17.1 참고)
 - **`reset.ps1` 은 토픽을 비우지 않는다.** 인메모리 큐 시절과 위험의 방향이 뒤집혔다 —
   6절의 함정 항목 참고
 
@@ -1202,3 +1203,86 @@ t=5초에 끝났는지 t=29초에 끝났는지 구별할 수단이 없다. 개�
 - **하네스를 먼저 고친다.** 부하 구간 안에서 실제 경과시간과 함께 `issuance` 행 수를
   샘플링해야 이 구현의 쓰기 속도를 잴 수 있다. 지금은 "≥160/s" 이상 말할 수 없다
 - 그 다음에야 **응답 p99 가 왜 11.74ms 로 밀렸는지**(Hikari 풀? CPU?)를 가를 수 있다
+
+---
+
+## 17. 소비 실패에도 보상을 붙인다 — `kafka-dlt-restore` (2026-08-15)
+
+15절은 **발행 실패**만 막았다. **소비 실패**는 그대로 열려 있었다.
+
+`IssuanceWriter` 는 `DataIntegrityViolationException`(중복)만 삼키고 나머지는 밖으로 던진다.
+그러면 `DefaultErrorHandler` 가 1초 × 3회 재시도하고 DLT 로 보낸다. 그 시점에
+
+- Redis 재고는 **이미 깎여 있고 아무도 되돌리지 않는다** → 과소발급
+- 그 사용자는 `coupon:{id}:users` 에 남아 **영영 재발급 불가**
+- DB 안에는 아무 모순이 없어 `verify` 는 전부 OK 로 통과한다
+
+**15절에서 프로듀서 쪽에 고친 것과 정확히 같은 결함이 컨슈머 쪽에 그대로 있었다.**
+MySQL 이 잠깐 죽거나 커넥션이 마르면 바로 터진다.
+
+### 17.1 먼저 발견한 것 — Kafka 자동설정이 아예 없었다
+
+DLT 를 확인하려고 브로커를 들여다봤더니 **`issuance.requested.DLT` 토픽이 없었다.**
+`KafkaTopicConfig` 가 `NewTopic` 빈으로 선언하고 있는데도 그렇다.
+
+```
+$ kafka-topics.sh --list
+__consumer_offsets
+issuance.requested          ← DLT 가 없다
+
+앱 로그의 "AdminClientConfig values" : 0건   ← AdminClient 가 한 번도 안 떴다
+spring-boot-autoconfigure-4.1.0.jar 안의 kafka 클래스 : 0개
+runtimeClasspath : org.springframework.kafka:spring-kafka   ← starter 가 아니다
+```
+
+원인은 의존성이다. `build.gradle.kts` 가 `spring-boot-starter-kafka` 가 아니라
+`org.springframework.kafka:spring-kafka` 를 직접 넣었는데, **Boot 4 부터 자동설정은 기술별
+모듈(`spring-boot-kafka`)로 쪼개져 starter 로만 딸려온다.** 그래서 Kafka 자동설정이 통째로 없었다.
+
+결과가 넷이다.
+
+| | 실제 상태 |
+|---|---|
+| `KafkaAdmin` | 없다 → `KafkaTopicConfig` 는 **죽은 코드**였다 |
+| `issuance.requested` | 앱이 아니라 **브로커 auto-create** 로 생겼다 |
+| 파티션 3 | `KafkaTopicConfig.partitions(3)` 이 아니라 `docker-compose.yml` 의 `KAFKA_NUM_PARTITIONS: 3` 에서 왔다 |
+| `application.yaml` 의 `spring.kafka.*` | `KafkaProperties` 바인딩이 없어 **거의 다 무시된다.** 지금 도는 건 `KafkaConfig` 가 `bootstrap-servers` 를 `@Value` 로 직접 읽어서다 |
+
+**14.7 에 "`KafkaTopicConfig` 의 `partitions(3)` 이 병렬도의 상한" 이라고 적었던 것은 틀렸다.**
+결과(파티션 3개)는 맞았지만 원인이 달랐다. 브로커 기본값이 바뀌면 조용히 따라 바뀐다.
+
+그리고 네 번째가 제일 위험하다 — **설정을 yaml 에 적어 두고 먹었다고 믿는** 상태다.
+이 프로젝트가 쿼리 로그·이미지 태그에서 반복해 당한 실패 모드와 같은 종류다.
+
+`KafkaConfig` 가 팩토리를 전부 손으로 만들고 있으므로 같은 방식으로 `KafkaAdmin` 빈을
+직접 추가해 살렸다. 의존성을 starter 로 바꾸면 자동설정이 통째로 딸려와 변수가 커진다.
+
+### 17.2 무엇을 고쳤나
+
+| 파일 | 고친 것 |
+|---|---|
+| `application/IssuanceCompensator.kt` (신설) | 보상 정책을 한 곳으로. `CouponService` 의 private `compensate` 를 여기로 옮겼다 |
+| `KafkaErrorHandlerConfig` | 리커버러를 감쌌다 — **DLT 발행 → 그 다음 `restore`** |
+| `KafkaConfig` | `KafkaAdmin` 빈 추가 (17.1) |
+
+**보상을 한 클래스로 모은 이유.** 발행 실패와 소비 실패는 "Redis 는 깎였는데 그 발급이
+성사되지 못했다" 는 **같은 상황**이다. 정책이 두 군데로 갈라지면 한쪽만 고치는 실수가 난다 —
+실제로 15절에서 한쪽만 고쳤다.
+
+**순서가 중요하다: 먼저 DLT 에 보존하고 그 다음에 되돌린다.** DLT 발행이 실패하면 거기서
+예외가 나가 오프셋이 안 올라가고 재처리된다(유실보다 낫다). 반대 순서였다면
+재고만 돌아오고 메시지는 사라지는 창이 생긴다.
+
+**역직렬화 실패는 되돌릴 수 없다.** 값이 없으니 `couponId` 를 알 수 없다.
+키는 `userId` 라 있지만 그것만으로는 부족하다. 조용히 넘어가면 재고가 샌 채 남으므로
+ERROR 로 크게 남기고 넘어간다. 되돌리려면 `couponId` 를 헤더에 실어야 한다 — 아직 안 했다.
+
+### 17.3 어떻게 확인하나 — `issuance` 테이블을 잠깐 치운다
+
+소비 실패를 일으켜야 하는데, MySQL 을 통째로 세우면 `CouponService.issue` 의 `findById` 부터
+막혀 요청이 컨슈머까지 가지도 못한다. **`issuance` 테이블만 잠깐 이름을 바꾼다** —
+`coupon` SELECT 는 되고 `INSERT issuance` 만 실패한다. `ddl-auto: update` 는 기동 시에만
+돌므로 중간에 테이블이 되살아나지 않는다.
+
+이때 사용자는 **200 OK 를 받는다.** 발행은 성공했기 때문이다 — "200 은 발급 완료가 아니라
+접수 완료" 라는 이 구조의 성격이 그대로 드러나는 자리다.

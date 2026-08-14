@@ -1,5 +1,6 @@
 package com.example.coupon.infrastructure.messaging
 
+import org.apache.kafka.clients.admin.AdminClientConfig
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.common.serialization.StringDeserializer
@@ -12,6 +13,7 @@ import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory
 import org.springframework.kafka.core.ConsumerFactory
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory
 import org.springframework.kafka.core.DefaultKafkaProducerFactory
+import org.springframework.kafka.core.KafkaAdmin
 import org.springframework.kafka.core.KafkaTemplate
 import org.springframework.kafka.core.ProducerFactory
 import org.springframework.kafka.listener.ContainerProperties
@@ -29,6 +31,19 @@ class KafkaConfig(
 ) {
 
     private val jsonMapper: JsonMapper = JacksonMapperUtils.enhancedJsonMapper()
+
+    /**
+     * 이 프로젝트에는 Kafka 자동설정이 없다. build.gradle.kts 가 spring-boot-starter-kafka 가 아니라
+     * org.springframework.kafka:spring-kafka 를 직접 넣었고, Boot 4 부터 자동설정은 기술별 모듈
+     * (spring-boot-kafka)에 있어 starter 로만 딸려온다. 그래서 KafkaAdmin 도 없었고,
+     * KafkaTopicConfig 의 NewTopic 빈은 아무 일도 하지 않고 있었다 — 토픽은 브로커의
+     * auto-create 로 생겼고 DLT 는 아무도 안 건드려서 아예 없었다.
+     *
+     * 팩토리를 전부 손으로 만드는 이 클래스의 방식대로 admin 도 여기서 만든다.
+     */
+    @Bean
+    fun kafkaAdmin(): KafkaAdmin =
+        KafkaAdmin(mapOf<String, Any>(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers))
 
     @Bean
     fun producerFactory(): ProducerFactory<String, Any> {

@@ -108,8 +108,8 @@ src/main/kotlin/com/example/coupon/
     UserIssuanceController.kt   내 발급 내역 조회
     dto/                        요청·응답 DTO (from() 팩토리로 엔티티 변환)
   application/
-    CouponService.kt            발급 흐름. 조회 → 게이트 통과 → 발행하고 즉시 반환.
-                                  발행 실패 시 restore 로 재고를 되돌리는 것도 여기
+    CouponService.kt            발급 흐름. 조회 → 게이트 통과 → 발행하고 즉시 반환
+    IssuanceCompensator.kt      깎인 재고를 되돌리는 정책 한 곳. 발행 실패·소비 실패가 같이 쓴다
     CouponIssuer.kt             Redis Lua 호출 래퍼. tryIssue / restore / initStock
     IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
     IssuanceService.kt          사용/조회
@@ -121,8 +121,9 @@ src/main/kotlin/com/example/coupon/
     IssuanceWriter.kt           쓰기 진입점. UNIQUE 위반을 멱등 처리로 삼킨다
     IssuanceTransactionWriter.kt  실제 @Transactional 경계. INSERT 하나뿐 (카운터는 안 건드린다)
     KafkaConfig.kt              프로듀서/컨슈머 팩토리. Jackson 3 직렬화, max.block.ms 3초
-    KafkaTopicConfig.kt         토픽 선언 (파티션 3 — 소비 병렬도의 상한)
-    KafkaErrorHandlerConfig.kt  재시도 1초 x 3회 → <topic>.DLT
+    KafkaTopicConfig.kt         토픽 선언 (파티션 3 = 소비 병렬도의 상한).
+                                  KafkaConfig 가 KafkaAdmin 을 만들어야 동작한다 — §7 함정 참고
+    KafkaErrorHandlerConfig.kt  재시도 1초 x 3회 → <topic>.DLT, 그리고 재고 복구
   domain/
     Coupon.kt                   재고 총량 + 발급 카운터
     Issuance.kt                 발급 1건
@@ -191,8 +192,12 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저
 (`kafka` 태그까지는 이 경로가 없었고, `CouponIssuer.restore` 는 `:issued` 라는
 존재하지 않는 키를 지우고 있어 불러도 반쪽만 돌아갔다.)
 
-**아직 안 막힌 자리 둘.** 워커가 DB 쓰기에서 예외를 만나면 재시도 3회 뒤 DLT 로 가고 재고는
-그대로 남는다. 그리고 ack 이 애매하게 실패하면 보상이 과잉이 되어 총량을 넘길 수 있다
+**소비 실패에도 보상이 붙었다** (`kafka-dlt-restore`, [§17](load-test-k6.md)).
+워커가 3회 재시도 끝에 DLT 로 보낼 때 같이 되돌린다. 순서는 **DLT 발행 → 복구** 다.
+정책은 `application/IssuanceCompensator` 한 곳에 있고 두 경로가 같이 쓴다.
+
+**아직 안 막힌 자리 둘.** 역직렬화가 실패하면 `couponId` 를 알 수 없어 되돌리지 못한다
+(ERROR 로그만 남는다). 그리고 ack 이 애매하게 실패하면 보상이 과잉이 되어 총량을 넘길 수 있다
 ([`load-test-k6.md` §15.3](load-test-k6.md)).
 
 ---
@@ -214,7 +219,8 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저
 | `queue-async` | 위와 같음 | 위와 같음, 단 Spring `@Async` + 이벤트로 | OK | 응답 5,000/s · 쓰기 ~155/틱 |
 | `kafka` | 위와 같음 | **Kafka (파티션 3, 컨슈머 3)** | OK (발행 실패 시 유실) | 응답 5,000/s · 쓰기 ~157/틱 |
 | `kafka-restore` | 위와 같음 | 위와 같음 + **발행 실패 시 재고 보상** | OK | 응답 5,000/s · 쓰기 ~160/틱 |
-| **`kafka-nocount` (현재)** | 위와 같음 | 위와 같음, 단 **워커에서 카운터 UPDATE 제거** | OK | **응답 5,000/s · 쓰기 ≥160/s (상한 미상)** |
+| `kafka-nocount` | 위와 같음 | 위와 같음, 단 **워커에서 카운터 UPDATE 제거** | OK | 응답 5,000/s · 쓰기 ≥160/s (상한 미상) |
+| **`kafka-dlt-restore` (현재)** | 위와 같음 | 위와 같음 + **소비 실패(DLT)에도 재고 보상** | OK | 위와 같음 |
 
 `pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있다.
 
@@ -390,6 +396,15 @@ Kafka 는 반대다. **메시지가 남는다.** 그래서 이제 위험은 유�
 `metrics.issue_latency.thresholds` 로 한다 (`true` = 넘김, `false` = 통과).
 `response/windows/run.ps1` 이 그것을 읽어 출력하고 종료 코드와 어긋나면 알려준다
 → [`load-test-k6.md` §13.2](load-test-k6.md)
+
+**이 프로젝트에는 Kafka 자동설정이 없다. `application.yaml` 의 `spring.kafka.*` 는 거의 다 무시된다.**
+`build.gradle.kts` 가 `spring-boot-starter-kafka` 가 아니라 `org.springframework.kafka:spring-kafka` 를
+직접 넣었고, Boot 4 부터 자동설정은 기술별 모듈(`spring-boot-kafka`)에 있어 starter 로만 딸려온다.
+실제로 `spring-boot-autoconfigure-4.1.0.jar` 안에 kafka 클래스가 하나도 없다.
+그래서 `KafkaProperties` 바인딩이 없고, 지금 도는 것은 `KafkaConfig` 가 `bootstrap-servers` 를
+`@Value` 로 직접 읽기 때문이다. **설정을 yaml 에 추가해도 조용히 안 먹는다 — `KafkaConfig` 를 고쳐야 한다.**
+`KafkaAdmin` 도 없어서 `KafkaTopicConfig` 가 죽은 코드였고(토픽은 브로커 auto-create 로 생겼다,
+DLT 는 아예 없었다), `KafkaConfig` 에 `KafkaAdmin` 빈을 직접 만들어 살렸다.
 
 **새로 만드는 `.ps1` 에는 UTF-8 BOM 을 붙인다.** PowerShell 5.1 은 BOM 이 없으면 파일을
 시스템 코드페이지(한국어 Windows 면 CP949)로 읽어 한글 주석이 깨지고, 운이 나쁘면

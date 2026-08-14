@@ -14,14 +14,12 @@ import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.LocalDateTime
 
-private val log = KotlinLogging.logger {}
-
-
 @Service
 class CouponService(
     private val couponRepository: CouponRepository,
     private val couponIssuer: CouponIssuer,
-    private val issuanceRequestProducer: IssuanceRequestProducer
+    private val issuanceRequestProducer: IssuanceRequestProducer,
+    private val issuanceCompensator: IssuanceCompensator,
 ) {
     @Transactional
     fun createCoupon(request: CreateCouponRequest): Coupon {
@@ -64,13 +62,15 @@ class CouponService(
             issuanceRequestProducer.publish(event)
                 // 콜백은 프로듀서 I/O 스레드에서 돈다. 요청 스레드를 잡지 않고,
                 // Redis 만 건드리므로 이 트랜잭션이 끝난 뒤에 실행돼도 상관없다.
-                .whenComplete { _, error -> if (error != null) compensate(couponId, userId, error) }
+                .whenComplete { _, error ->
+                    if (error != null) issuanceCompensator.compensate(couponId, userId, error, PHASE)
+                }
         }
         catch (e: Exception) {
             // send 가 즉시 던지는 경우 (직렬화 실패, 메타데이터 대기 초과 = max.block.ms).
             // 되돌렸으므로 이 사용자는 지금 다시 시도하면 성공한다. 그래서 500 이 아니라 503 이다.
             // 원인 예외는 compensate 안에서 ERROR 로그로 남으므로 여기서 흘려보내도 잃지 않는다.
-            compensate(couponId, userId, e)
+            issuanceCompensator.compensate(couponId, userId, e, PHASE)
             throw IssuanceAcceptFailedException()
         }
 
@@ -82,22 +82,7 @@ class CouponService(
         )
     }
 
-    /**
-     * 큐에 넣지 못했으니 발급 자격을 되돌린다.
-     *
-     * 보상 자체가 실패하는 경우까지는 막지 못한다 (Redis 가 죽어 있으면 되돌릴 수단이 없다).
-     * 그때는 로그가 유일한 흔적이므로 ERROR 로 남긴다.
-     */
-    private fun compensate(couponId: Long, userId: Long, cause: Throwable) {
-        try {
-            val restored = couponIssuer.restore(couponId, userId)
-            log.error(cause) {
-                "발급 요청 발행 실패 — 재고 보상 ${if (restored) "완료" else "불필요(이미 되돌아감)"}: " +
-                    "couponId=$couponId, userId=$userId"
-            }
-        }
-        catch (e: Exception) {
-            log.error(e) { "발급 요청 발행 실패 후 재고 보상마저 실패: couponId=$couponId, userId=$userId" }
-        }
+    companion object {
+        private const val PHASE = "발급 요청 발행"
     }
 }
