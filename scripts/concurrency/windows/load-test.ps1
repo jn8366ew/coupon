@@ -18,15 +18,15 @@
     자세한 내용은 docs/load-test-k6.md 참고.
 
 .EXAMPLE
-    .\scripts\windows\load-test.ps1 over_issuance
+    .\scripts\concurrency\windows\load-test.ps1over_issuance
     과발급 검증 (재고만큼만 발급되어야 한다)
 
 .EXAMPLE
-    .\scripts\windows\load-test.ps1 duplicate_issuance
+    .\scripts\concurrency\windows\load-test.ps1duplicate_issuance
     중복발급 검증 (1인 1매만 발급되어야 한다)
 
 .EXAMPLE
-    .\scripts\windows\load-test.ps1 over_issuance -KeepLogging
+    .\scripts\concurrency\windows\load-test.ps1over_issuance -KeepLogging
     쿼리 로그를 켠 채로 실행한다. 무슨 SQL 이 나가는지 봐야 할 때만 쓰고,
     이때 나온 성능 수치는 브랜치 비교에 쓰지 않는다.
 #>
@@ -41,7 +41,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..')
+# scripts/concurrency/windows -> 저장소 루트 (세 단계)
+Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..\..')
 
 function Invoke-Step {
     param(
@@ -173,7 +174,7 @@ $summaryName = "$Scenario-$imageTag.json"
 Invoke-Step "k6 실행 ($Scenario, $imageTag)" {
     docker compose run --rm `
         -e COUPON_ID=$couponId `
-        k6 run --summary-export "/out/$summaryName" "/scripts/$Scenario.js"
+        k6 run --summary-export "/out/$summaryName" "/scripts/concurrency/windows/k6/$Scenario.js"
 }
 
 # coupon.issued_quantity 는 요청마다 올리지 않고 Redis 재고에서 파생시켜 주기적으로 반영한다

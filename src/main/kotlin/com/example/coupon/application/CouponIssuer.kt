@@ -1,5 +1,7 @@
 package com.example.coupon.application
 
+import com.example.coupon.support.AlreadyIssuedException
+import com.example.coupon.support.SoldOutException
 import org.springframework.core.io.ClassPathResource
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.data.redis.core.script.RedisScript
@@ -24,17 +26,17 @@ class CouponIssuer (
      * 발급 자격을 판정하고, 통과하면 그 자리에서 재고를 차감한다.
      * DB 를 전혀 건드리지 않으므로 거절되는 요청은 커넥션조차 잡지 않는다.
      */
-    fun tryIssue(couponId: Long, userId: Long): IssueResult {
+    fun tryIssue(couponId: Long, userId: Long) {
         val raw = redisTemplate.execute(
             script,
-            listOf(stockKey(couponId), issuedKey(couponId)),
+            listOf(stockKey(couponId), usersKey(couponId)),
             userId.toString(),
         ) ?: error("Lua 스크립트 결과가 Null")
 
         return when (raw) {
-            1L -> IssueResult.OK
-            0L -> IssueResult.SOLD_OUT
-            -1L -> IssueResult.DUPLICATE
+            1L -> Unit
+            0L -> throw SoldOutException()
+            -1L -> throw AlreadyIssuedException()
             else -> error("예상치 못한 Lua 결과: $raw")
         }
     }
@@ -59,4 +61,6 @@ class CouponIssuer (
     private fun stockKey(couponId: Long) = "coupon:$couponId:stock"
 
     private fun issuedKey(couponId: Long) = "coupon:$couponId:issued"
+
+    private fun usersKey(couponId: Long) = "coupon:$couponId:users"
 }

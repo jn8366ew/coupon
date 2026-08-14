@@ -2,7 +2,7 @@
 // 사용자 20,000명이 30초 동안 초당 5,000번 요청 → 5,000장 재고를 두고 다 같이 경쟁.
 // 실제 발급된 issuance 행 수가 5,000장을 넘으면 과발급 결함.
 //
-// scripts/load/over_issuance.js (mac 로컬 k6 용) 의 Windows/Docker 판본.
+// scripts/concurrency/load/over_issuance.js (mac 로컬 k6 용) 의 Windows/Docker 판본.
 // 부하 조건(rate, VU, USER_POOL)은 두 판본이 같아야 결과를 비교할 수 있다.
 import http from 'k6/http';
 import { check } from 'k6';

@@ -4,7 +4,7 @@
     발급량과 동시성 결함을 확인한다.
 
 .DESCRIPTION
-    scripts/load/verify.sh 의 Windows 판본. 판정 기준은 bash 판과 동일하다.
+    scripts/concurrency/load/verify.sh 의 Windows 판본. 판정 기준은 bash 판과 동일하다.
 
     issued_quantity  coupon.issued_quantity (카운터 필드)
     total_quantity   재고 총량
@@ -14,7 +14,7 @@
     count_match      issued_quantity = issuance_rows → 카운터가 실제와 맞음 (race 없음)
 
 .EXAMPLE
-    .\scripts\windows\verify.ps1 -CouponId 1
+    .\scripts\concurrency\windows\verify.ps1 -CouponId 1
 #>
 [CmdletBinding()]
 param(
@@ -23,7 +23,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..')
+Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..\..')
 
 $sql = @"
   SELECT

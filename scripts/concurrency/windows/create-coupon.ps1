@@ -4,7 +4,7 @@
     쿠폰 한 개를 만들고 그 ID 를 출력한다.
 
 .DESCRIPTION
-    scripts/load/create_coupon.sh 의 Windows 판본. bash 판은 jq 로 응답을 파싱하지만
+    scripts/concurrency/load/create_coupon.sh 의 Windows 판본. bash 판은 jq 로 응답을 파싱하지만
     Windows 에는 jq 가 없는 경우가 많아 PowerShell 이 기본 제공하는
     Invoke-RestMethod 로 JSON 을 그대로 객체로 받는다. 추가 도구가 필요 없다.
 
@@ -12,7 +12,7 @@
     (컨테이너 안에서 도는 k6 과 달리 coupon-service 라는 이름은 여기서 해석되지 않는다.)
 
 .EXAMPLE
-    $couponId = .\scripts\windows\create-coupon.ps1
+    $couponId = .\scripts\concurrency\windows\create-coupon.ps1
     쿠폰을 만들고 ID 를 변수에 담는다.
 #>
 [CmdletBinding()]

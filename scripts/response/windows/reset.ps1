@@ -1,16 +1,18 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    coupon / issuance 테이블을 비운다.
+    coupon / issuance 테이블과 Redis 를 비운다.
 
 .DESCRIPTION
-    부하 테스트는 매번 깨끗한 상태에서 시작해야 발급 수를 재고와 비교할 수 있다.
-    mysql 컨테이너 안에서 TRUNCATE 후 행 수를 확인한다 (둘 다 0 이어야 정상).
+    응답시간 트랙(scripts/response)용. scripts/concurrency/windows/reset.ps1 과 동작이 같다.
+    두 트랙이 서로 영향을 주지 않도록 일부러 복제해 두었다 — 한쪽 하네스를 고치다
+    다른 쪽 측정 조건이 조용히 바뀌는 것을 막기 위해서다.
 
-    scripts/load/reset.sh 의 Windows 판본.
+    이 트랙은 라운드를 두 번 돌리므로(워밍업 + 본 측정) 라운드 사이에 이것이 불린다.
+    서비스 컨테이너는 건드리지 않는다. JVM/JIT, Hikari 풀이 살아 있어야 2회차가 steady-state 다.
 
 .EXAMPLE
-    .\scripts\windows\reset.ps1
+    .\scripts\response\windows\reset.ps1
 #>
 [CmdletBinding()]
 param()
@@ -18,7 +20,8 @@ param()
 $ErrorActionPreference = 'Stop'
 
 # 어느 디렉터리에서 실행하든 docker-compose.yml 이 있는 프로젝트 루트 기준으로 동작하게 한다
-Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..')
+# (scripts/response/windows -> 세 단계 위)
+Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..\..')
 
 $sql = @'
 SET FOREIGN_KEY_CHECKS=0; TRUNCATE issuance; TRUNCATE coupon; SET FOREIGN_KEY_CHECKS=1;
@@ -40,9 +43,9 @@ if ($LASTEXITCODE -ne 0) {
 # Redis 도 같이 비운다.
 #
 # 발급 자격 판정이 Redis 로 옮겨오면서 coupon:{id}:issued 집합에 사용자가 누적된다.
-# TRUNCATE 로 coupon.id 가 1부터 다시 시작하므로, 비우지 않으면 이전 실행이 남긴 집합을
-# 그대로 물려받아 두 번째 실행부터 모든 요청이 "이미 발급" 으로 튕긴다 (발급 0건).
-# 재고 키는 쿠폰 생성 때 initStock 이 덮어쓰므로 지금까지는 이 문제가 드러나지 않았다.
+# TRUNCATE 로 coupon.id 가 1부터 다시 시작하므로, 비우지 않으면 이전 라운드가 남긴 집합을
+# 그대로 물려받아 2회차부터 모든 요청이 "이미 발급" 으로 튕긴다 (발급 0건).
+# 워밍업 + 본 측정으로 두 번 도는 이 트랙에서는 특히 빠지면 안 된다.
 docker compose exec -T redis redis-cli FLUSHALL
 
 if ($LASTEXITCODE -ne 0) {

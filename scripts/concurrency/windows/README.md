@@ -1,9 +1,11 @@
-# 부하 테스트 (Windows)
+# 정확성 부하 테스트 (Windows)
 
-`scripts/load/` 의 mac 용 스크립트(bash + 로컬 k6 + jq)를 Windows 환경으로 옮긴 것.
+`scripts/concurrency/load/` 의 mac 용 스크립트(bash + 로컬 k6 + jq)를 Windows 환경으로 옮긴 것.
 **원본은 건드리지 않았다.** 두 판본은 부하 조건(rate, VU, USER_POOL)이 같아야 결과를 비교할 수 있다.
 
-| | mac (`scripts/load/`) | Windows (`scripts/windows/`) |
+응답시간(P99)을 재는 트랙은 따로 있다 → `scripts/response/windows/README.md`
+
+| | mac (`concurrency/load/`) | Windows (`concurrency/windows/`) |
 |---|---|---|
 | 셸 | bash | PowerShell 5.1+ |
 | k6 | 로컬 설치 (`brew install k6`) | compose 의 `k6` 서비스 (설치 불필요) |
@@ -23,10 +25,10 @@ compose 의 `profiles: ["load"]` 덕분에 평소 `docker compose up -d` 에는 
 
 ```powershell
 # 1) 과발급 검증 (재고만큼만 발급되어야 한다)
-.\scripts\windows\load-test.ps1 over_issuance
+.\scripts\concurrency\windows\load-test.ps1 over_issuance
 
 # 2) 중복발급 검증 (1인 1매만 쿠폰 발급되어야 한다)
-.\scripts\windows\load-test.ps1 duplicate_issuance
+.\scripts\concurrency\windows\load-test.ps1 duplicate_issuance
 ```
 
 `load-test.ps1` 이 **쿼리 로그 끄기 → 리셋 → 쿠폰 생성 → k6 → 검증**을 한 번에 돌리고
@@ -46,7 +48,7 @@ compose 의 `profiles: ["load"]` 덕분에 평소 `docker compose up -d` 에는 
 
 ```powershell
 .\build-and-run.ps1 -Tag pessimistic     # 빌드 + 기동
-.\scripts\windows\load-test.ps1 over_issuance
+.\scripts\concurrency\windows\load-test.ps1 over_issuance
 #   → 화면에 "측정 대상 이미지: coupon-service:pessimistic"
 #   → build\k6\over_issuance-pessimistic.json
 
@@ -60,10 +62,10 @@ compose 의 `profiles: ["load"]` 덕분에 평소 `docker compose up -d` 에는 
 단계를 나눠 돌리려면:
 
 ```powershell
-.\scripts\windows\reset.ps1
-$couponId = .\scripts\windows\create-coupon.ps1
-docker compose run --rm -e COUPON_ID=$couponId k6 run /scripts/over_issuance.js
-.\scripts\windows\verify.ps1 -CouponId $couponId
+.\scripts\concurrency\windows\reset.ps1
+$couponId = .\scripts\concurrency\windows\create-coupon.ps1
+docker compose run --rm -e COUPON_ID=$couponId k6 run /scripts/concurrency/windows/k6/over_issuance.js
+.\scripts\concurrency\windows\verify.ps1 -CouponId $couponId
 ```
 
 ## 결과를 믿기 전에 확인할 것
@@ -78,7 +80,7 @@ docker compose run --rm -e COUPON_ID=$couponId k6 run /scripts/over_issuance.js
 `verify` 는 발급 0건을 보고 `over_issuance=OK`, `count_match=OK` → **PASS** 를 출력한다.
 즉 "동시성 결함이 없다"는 정반대 결론이 나온다.
 
-> `scripts/load/` 의 mac 판본과 `scripts/api.sh` 는 아직 `/api/coupons` 를 호출하는데
+> `scripts/concurrency/load/` 의 mac 판본과 `scripts/concurrency/api.sh` 는 아직 `/api/coupons` 를 호출하는데
 > 실제 컨트롤러 경로는 `/api/v1/coupons` 다 (`CouponController.kt`). 그대로 돌리면 전부 404 다.
 > Windows 판본에는 `/api/v1` 로 반영해 두었다.
 
@@ -108,14 +110,14 @@ scenarios: { issue: {
 ```
 
 이러면 "20,000건을 몇 초에 처리했나" 를 브랜치끼리 직접 비교할 수 있다.
-다만 이는 `scripts/load/` 의 mac 판본과 부하 조건이 달라진다는 뜻이므로,
+다만 이는 `scripts/concurrency/load/` 의 mac 판본과 부하 조건이 달라진다는 뜻이므로,
 바꾼다면 양쪽 판본에 같이 반영해야 한다. **아직 적용하지 않았다.**
 
 실측 수치와 분석 근거는 `docs/load-test-k6.md` 8절에 있다.
 
 ### 4. 결과 해석
 
-`verify.ps1` 이 보여주는 컬럼과 판정 기준은 `scripts/load/README.md` 의 "결과 해석" 절과 같다.
+`verify.ps1` 이 보여주는 컬럼과 판정 기준은 `scripts/concurrency/load/README.md` 의 "결과 해석" 절과 같다.
 `part-2-1-load-test` 에서는 **`FAIL` 이 떠야 정상**이다 (v0 결함 재현이 목적).
 여기서 PASS 가 뜨면 결함이 없는 게 아니라 부하가 안 걸린 것을 먼저 의심한다.
 

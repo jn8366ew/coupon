@@ -7,7 +7,7 @@
 [`domain-model.md`](domain-model.md), 테이블 정의는 [`db-schema.md`](db-schema.md) 에 있다.
 여기서는 그 숫자들을 다시 적지 않고 가리키기만 한다.
 
-기준 시점: 2026-08-14, `coupon-service:lua-wb` 측정 직후.
+기준 시점: 2026-08-14, `coupon-service:queue-mem` 측정 직후.
 
 ---
 
@@ -21,9 +21,9 @@
 - `application.yaml` 이 쿼리 로그를 켜 두고 있다 (개발 중 SQL 을 보려고)
 
 **구현 전환은 브랜치가 아니라 이미지 태그로 한다.** `naive`, `pessimistic`, `lua`,
-`lua-fix`, `lua-gate`, `lua-wb`, `lua-pool` 을 같은 소스 트리에서 번갈아 빌드해 태그만 다르게 붙인다
-(각각이 무엇인지는 §5). 브랜치로 나누면 스크립트·문서를 고칠 때마다 여러 곳에 포팅해야 하고,
-서로 다른 하네스로 잰 수치는 비교가 성립하지 않기 때문이다.
+`lua-fix`, `lua-gate`, `lua-wb`, `lua-pool`, `queue-mem` 을 같은 소스 트리에서 번갈아 빌드해
+태그만 다르게 붙인다 (각각이 무엇인지는 §5). 브랜치로 나누면 스크립트·문서를 고칠 때마다
+여러 곳에 포팅해야 하고, 서로 다른 하네스로 잰 수치는 비교가 성립하지 않기 때문이다.
 
 ```powershell
 .\build-and-run.ps1 -Tag pessimistic     # 빌드해서 그 태그로 띄운다
@@ -47,24 +47,34 @@
 
 ```
 CouponController.issue
-  └─ CouponService.issue                    트랜잭션 없음
-       ├─ couponIssuer.tryIssue             Redis Lua — 발급 자격 판정 전체가 여기서 원자적으로 끝난다
-       │                                      SOLD_OUT / DUPLICATE 는 여기서 끝. DB 커넥션을 잡지 않는다
-       └─ issuanceWriter.write              @Transactional — 통과한 요청만
-            ├─ couponRepository.findById      SELECT coupon (만료일 계산용)
-            ├─ coupon.isBookingOpen(now)      시작 전이면 NOT_STARTED
-            └─ issuanceRepository.save        INSERT issuance
-       ⤷ write 가 실패하면 couponIssuer.restore 로 Redis 재고를 되돌린다
+  └─ CouponService.issue                    @Transactional
+       ├─ couponRepository.findById          SELECT coupon (없으면 COUPON_NOT_FOUND)
+       ├─ coupon.isBookingOpen(now)          시작 전이면 NOT_STARTED
+       ├─ couponIssuer.tryIssue              Redis Lua — 발급 자격 판정이 여기서 원자적으로 끝난다
+       │                                       SOLD_OUT / ALREADY_ISSUED 는 여기서 예외로 끝
+       └─ issuanceQueue.enqueue              인메모리 큐에 넣고 곧바로 200 을 반환한다
+                                               큐가 꽉 차면 QUEUE_FULL (503)
+
+  ⤷ InMemoryIssuanceWorker — 데몬 스레드 1개가 큐를 계속 비운다
+       └─ IssuanceWriter.write                UNIQUE 위반은 멱등 처리로 삼키고 넘어간다
+            └─ IssuanceTransactionWriter.insertAndIncrement   @Transactional
+                 ├─ issuanceRepository.save                     INSERT issuance
+                 └─ couponRepository.incrementIssueQuantity     UPDATE coupon
 ```
 
-**판정은 Redis, 기록은 DB** 로 나뉘어 있는 것이 이 구조의 핵심이다.
+**판정은 Redis, 기록은 큐 뒤의 워커** 로 나뉘어 있는 것이 이 구조의 핵심이다.
 경합이 몰리는 자리(재고 차감, 1인 1매)는 전부 Redis 의 Lua 스크립트 안에 있고,
-DB 는 서로 다른 행에 INSERT 만 하므로 요청끼리 직렬화되지 않는다.
+DB 쓰기는 응답 경로에서 빠져 있다. 그래서 사용자 응답 p99 가 705ms → 5.61ms 가 됐다
+([`load-test-k6.md` §13.3](load-test-k6.md)).
 
-`coupon.issued_quantity` 는 발급 요청이 올리지 않는다. `IssuedQuantitySynchronizer` 가
-1초마다 `total_quantity − (Redis 재고)` 로 덮어쓰는 파생 값이다 (write-behind).
-요청마다 그 열을 올리던 시절에는 모든 요청이 그 한 행의 UPDATE 에서 줄을 서서
-처리량이 초당 290건에 묶여 있었다 ([`load-test-k6.md` §12.4](load-test-k6.md)).
+**중요한 것은 200 OK 가 "발급 완료" 가 아니라 "접수 완료" 라는 점이다.** 응답 본문의
+`id` 는 아직 저장 전이라 `null` 이고, 실제 행은 워커가 나중에 쓴다. 5,000건을 다 쓰는 데
+부하 종료 후 9초가 더 걸린다 (초당 약 155행 — [`load-test-k6.md` §13.5](load-test-k6.md)).
+
+`coupon.issued_quantity` 를 **두 곳에서 쓴다.** 워커가 이벤트마다 `+1` 하고,
+`IssuedQuantitySynchronizer` 가 1초마다 `total_quantity − (Redis 재고)` 로 덮어쓴다.
+드레인이 끝나면 둘 다 같은 값으로 수렴하지만, 이 열이 검증에서 잡아주는 것은 이제 없다
+([`load-test-k6.md` §13.6](load-test-k6.md)).
 
 예외는 전부 `support/DomainException.kt` 의 sealed 계층이고,
 `support/GlobalExceptionHandler.kt` 가 RFC 9457 ProblemDetail 로 변환한다.
@@ -86,11 +96,16 @@ src/main/kotlin/com/example/coupon/
     UserIssuanceController.kt   내 발급 내역 조회
     dto/                        요청·응답 DTO (from() 팩토리로 엔티티 변환)
   application/
-    CouponService.kt            발급 흐름. 게이트 통과 → 쓰기 → 실패 시 보상
+    CouponService.kt            발급 흐름. 조회 → 게이트 통과 → 큐에 넣고 즉시 반환
     CouponIssuer.kt             Redis Lua 호출 래퍼. tryIssue / restore / initStock
-    IssuanceWriter.kt           게이트를 통과한 요청의 DB 쓰기 (@Transactional 경계)
     IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
     IssuanceService.kt          사용/조회
+  infrastructure/messaging/
+    InMemoryIssuanceQueue.kt    LinkedBlockingQueue(용량 10,000). 꽉 차면 QUEUE_FULL
+    IssuanceRequested.kt        큐에 실리는 이벤트 (couponId, userId, 발급/만료 시각)
+    InMemoryIssuanceWorker.kt   데몬 스레드 1개. @PostConstruct 로 뜨고 큐를 계속 비운다
+    IssuanceWriter.kt           워커의 쓰기 진입점. UNIQUE 위반을 멱등 처리로 삼킨다
+    IssuanceTransactionWriter.kt  실제 @Transactional 경계. INSERT + 카운터 UPDATE
   domain/
     Coupon.kt                   재고 총량 + 발급 카운터
     Issuance.kt                 발급 1건
@@ -135,7 +150,7 @@ src/main/resources/
 | 키 | 타입 | 누가 만드나 |
 |---|---|---|
 | `coupon:{id}:stock` | String (정수) | `CouponIssuer.initStock` — 쿠폰 생성 시 `total_quantity` 로 초기화 |
-| `coupon:{id}:issued` | Set (userId) | `issue.lua` 가 발급 성공 시 `SADD` |
+| `coupon:{id}:users` | Set (userId) | `issue.lua` 가 발급 성공 시 `SADD` |
 
 **재고의 진실은 DB 가 아니라 Redis 에 있다.** `resources/lua/issue.lua` 한 스크립트가
 중복 여부와 재고를 함께 판정하고 그 자리에서 차감한다.
@@ -147,56 +162,92 @@ Lua 스크립트는 이 여러 명령을 **Redis 서버 안에서 한 덩어리�
 **Lua 를 쓰는 이유는 속도가 아니라 이 원자성이다.**
 
 Redis 는 DB 트랜잭션 밖이므로 차감 뒤 DB 쓰기가 실패해도 저절로 돌아오지 않는다.
-`CouponService.issue` 가 실패를 잡아 `CouponIssuer.restore` 로 되돌린다.
-이 보상이 없으면 그 한 장은 아무에게도 가지 않은 채 사라진다 —
+**지금 그 보상이 없다.** 워커가 예외를 만나면 로그만 찍고 이벤트를 버리며,
+`CouponIssuer.restore` 는 남아 있지만 부르는 곳이 없다 (게다가 키 이름이 `:issued` 인 채라
+그대로 쓰면 동작하지 않는다). 인메모리 큐라 프로세스가 죽어도 같은 일이 생긴다.
+
+보상이 없으면 그 한 장은 아무에게도 가지 않은 채 사라진다 —
 실제로 `lua` 태그에서 1,000명 시나리오 한 번에 23장이 샜고,
-**DB 만 보는 `verify.ps1` 은 그것을 OK 로 통과시켰다** ([`load-test-k6.md` §12.2](load-test-k6.md)).
+**DB 만 보는 검증은 그것을 OK 로 통과시켰다** ([`load-test-k6.md` §12.2](load-test-k6.md)).
+`queue-mem` 측정 두 라운드에서는 누수가 0 이었지만, 막혀 있어서가 아니라 안 터졌을 뿐이다.
+`scripts/response/windows/verify-burst.ps1` 이 매번 Redis 잔여 재고를 같이 출력하는 이유다.
 
 ---
 
-## 5. 세 구현의 차이
+## 5. 구현들의 차이
 
 같은 소스 트리에서 `CouponService.issue` 주변만 바꿔가며 만든다.
 
-| 태그 | 재고 판정 | `issued_quantity` | 정확성 | 처리량 |
+| 태그 | 재고 판정 | DB 쓰기 | 정확성 | 처리량 |
 |---|---|---|---|---:|
-| `naive` | `isSoldOut()` 만 | 요청마다 `++` (dirty checking) | FAIL — 과발급, 카운터 90% 유실 | ~290/s |
-| `pessimistic` | `SELECT … FOR UPDATE` 후 검사 | 락 안에서 증가 | OK | ~263/s |
-| `lua` | Redis Lua 원자 차감 (DB 검사 뒤) | 요청마다 원자 UPDATE | OK (단, 재고 누수 있음) | ~285/s |
+| `naive` | `isSoldOut()` 만 | 동기, 요청마다 `++` (dirty checking) | FAIL — 과발급, 카운터 90% 유실 | ~290/s |
+| `pessimistic` | `SELECT … FOR UPDATE` 후 검사 | 동기, 락 안에서 증가 | OK | ~263/s |
+| `lua` | Redis Lua 원자 차감 (DB 검사 뒤) | 동기, 원자 UPDATE | OK (단, 재고 누수 있음) | ~285/s |
 | `lua-fix` | 위와 같음 + 롤백 시 재고 복구 | 위와 같음 | OK | ~278/s |
-| `lua-gate` | Lua 게이트를 DB 접근 **앞으로** | 요청마다 원자 UPDATE | OK | ~252/s |
-| `lua-wb` | Lua 게이트가 맨 앞 | write-behind (1초 주기) | OK | ~2,700/s |
-| **`lua-pool` (현재)** | 위와 같음 | 위와 같음 | OK | **~4,000/s** |
+| `lua-gate` | Lua 게이트를 DB 접근 **앞으로** | 위와 같음 | OK | ~252/s |
+| `lua-wb` | Lua 게이트가 맨 앞 | 동기 INSERT, 카운터는 write-behind | OK | ~2,700/s |
+| `lua-pool` | 위와 같음 | 위와 같음 (Hikari 풀 10 → 50) | OK | ~4,000/s |
+| **`queue-mem` (현재)** | 게이트가 DB 조회 **뒤로** 돌아옴 | **인메모리 큐 + 워커 1개 (비동기)** | OK | **응답 5,000/s · 쓰기 ~155/s** |
 
-`pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있고,
-`incrementIssueQuantity` 도 되돌려 비교할 수 있게 남겨 두었다.
+`pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있다.
 
-**이 표에서 읽어야 할 것**: `lua` → `lua-gate` 까지 처리량이 전혀 안 움직였다.
-Redis 를 붙여 놓고도 `coupon` 단일 행 UPDATE 를 요청 경로에 남겨 두었기 때문이다.
-그 UPDATE 를 빼자(`lua-wb`) 10배가 됐다. **경합 지점을 DB 밖으로 빼는 것이 Lua 의 값어치인데,
-DB 쪽 경합을 같이 없애지 않으면 복잡도만 늘고 이득이 없다.**
+**이 표에서 읽어야 할 것 둘.**
 
-`lua-pool` 은 코드 변경이 아니라 `application.yaml` 의 Hikari 풀 크기를 10 → 50 으로 올린 것이다.
-행 락이 사라지자 다음 병목이 커넥션 수로 드러났다.
-자세한 분석은 [`load-test-k6.md` §12](load-test-k6.md).
+`lua` → `lua-gate` 까지 처리량이 전혀 안 움직였다. Redis 를 붙여 놓고도 `coupon` 단일 행
+UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자(`lua-wb`) 10배가 됐다.
+**경합 지점을 DB 밖으로 빼는 것이 Lua 의 값어치인데, DB 쪽 경합을 같이 없애지 않으면
+복잡도만 늘고 이득이 없다.**
+
+`queue-mem` 의 처리량 칸이 둘로 갈라진 것이 이 구현의 성격을 그대로 말한다.
+사용자 응답은 부하 상한(5,000/s)을 그대로 소화하는데 DB 쓰기는 초당 155건이다.
+**큐는 병목을 없앤 것이 아니라 사용자 응답 밖으로 옮겼다.** 워커가 단일 스레드인 데다
+`incrementIssueQuantity`(= `coupon` 단일 행 UPDATE)가 워커 안으로 되돌아온 탓이다 —
+`lua-wb` 에서 10배를 만들어 준 그 쿼리가 자리만 바꿔 다시 들어와 있다.
+
+자세한 분석은 [`load-test-k6.md` §12](load-test-k6.md)(동기 구현들)과
+[§13](load-test-k6.md)(큐 디커플링).
 
 ---
 
 ## 6. 부하 테스트 하네스
 
-Windows 판은 `scripts/windows/`, mac 원본은 `scripts/load/` 다.
-**mac 판은 수정하지 않는다.** 두 판본의 부하 조건(rate, VU, USER_POOL)이 같아야 결과를 비교할 수 있다.
+**하네스는 두 트랙이다.** 재는 것이 다르면 시나리오도 검증도 달라야 하기 때문이다.
+
+| 트랙 | 재는 것 | 한 줄 실행 |
+|---|---|---|
+| `scripts/concurrency/` | 정확성 — 과발급·중복발급·카운터 일치 | `.\scripts\concurrency\windows\load-test.ps1 <시나리오>` |
+| `scripts/response/` | 응답시간 — `issue_latency` 분포(P99), 부하 전달률 | `.\scripts\response\windows\run.ps1` |
+
+각 트랙 안에서 Windows 판은 `<트랙>/windows/`, mac 원본(bash + 로컬 k6)은 `<트랙>/load/` 또는
+트랙 루트에 있다. **mac 판은 수정하지 않는다.** 두 판본의 부하 조건(rate, VU, USER_POOL)이
+같아야 결과를 비교할 수 있고, 실제로 두 트랙도 같은 조건을 쓴다
+(`constant-arrival-rate` 5,000/s × 30s, USER_POOL 20,000, 재고 5,000).
 
 ### 역할 분담
 
 | 스크립트 | 하는 일 |
 |---|---|
 | `build-and-run.ps1` | jib 로 이미지 빌드 → `docker load` → 태그를 `.env` 에 기록 → compose 기동 |
-| `scripts/windows/load-test.ps1` | 쿼리 로그 끄기 → 리셋 → 쿠폰 생성 → k6 → 카운터 동기화 대기 → 검증 |
-| `scripts/windows/reset.ps1` | `coupon` / `issuance` TRUNCATE + Redis `FLUSHALL` |
-| `scripts/windows/create-coupon.ps1` | 쿠폰 1개 생성하고 ID 를 표준출력으로 반환 |
-| `scripts/windows/verify.ps1` | 판정 SQL 실행 → 과발급/카운터 일치 여부 출력 |
-| `scripts/windows/k6/*.js` | k6 시나리오. `constant-arrival-rate` 5,000/s × 30s |
+| `concurrency/windows/load-test.ps1` | 쿼리 로그 끄기 → 리셋 → 쿠폰 생성 → k6 → 카운터 동기화 대기 → 검증 |
+| `response/windows/run.ps1` | 위와 같되 **워밍업 1회 + 본 측정 1회**, 검증은 드레인 폴링 |
+| `<트랙>/windows/reset.ps1` | `coupon` / `issuance` TRUNCATE + Redis `FLUSHALL` |
+| `<트랙>/windows/create-coupon.ps1` | 쿠폰 1개 생성하고 ID 를 표준출력으로 반환 |
+| `concurrency/windows/verify.ps1` | 판정 SQL 실행 → 과발급/카운터 일치 여부 출력 |
+| `response/windows/verify-burst.ps1` | 쓰기가 멈출 때까지 폴링 → 위 판정 + **Redis 잔여 재고** |
+| `<트랙>/windows/k6/*.js` | k6 시나리오 |
+
+`reset.ps1` / `create-coupon.ps1` 은 두 트랙에 **일부러 복제**해 두었다. 한쪽 하네스를 고치다
+다른 쪽 측정 조건이 조용히 바뀌는 것을 막기 위해서다.
+
+### 응답시간 트랙에만 있는 것
+
+- **워밍업 라운드.** 1회차는 버린다. JIT·Hikari 풀이 데워지는 비용이 섞이기 때문이다.
+  실측으로 1회차 p99 102.93ms → 2회차 5.61ms 로 18배 차이가 났다
+- **드레인 폴링.** 큐 구현에서는 k6 이 끝나도 워커가 계속 쓴다. `issuance` 행 수가 멈출 때까지
+  기다린 뒤 검증한다. 이 폴링이 끝난 뒤에 다음 라운드의 리셋이 돌므로 라운드끼리 안 섞인다
+- **`status 0` 을 지연 분포에서 제외.** 연결 거부는 `duration ≈ 0ms` 로 기록돼 p99 를
+  실제보다 좋게 만든다. `status_conn_error` 로 따로 세고 같이 읽는다
+  ([`load-test-k6.md` §13.2](load-test-k6.md))
 
 ### compose 구성 (`docker-compose.yml`)
 
@@ -208,18 +259,27 @@ Windows 판은 `scripts/windows/`, mac 원본은 `scripts/load/` 다.
   (Windows 의 localhost 포트포워딩을 안 거친다)
 - `docker-compose.loadtest.yml` 은 측정 시 쿼리 로그를 끄는 override
 
-### 검증 기준 (`verify.ps1`)
+### 검증 기준
 
 | 컬럼 | 뜻 |
 |---|---|
 | `over_issuance` | `issuance_rows > total_quantity` → FAIL. 전역 N장 보장이 깨짐 |
-| `count_match` | `issued_quantity = issuance_rows` → OK. **Redis 가 센 수와 DB 에 들어간 수의 교차 검증** |
+| `count_match` | `issued_quantity = issuance_rows`. **지금은 의미가 옅다** — 아래 참고 |
 | `duplicate_users` | 같은 사용자가 2장 이상 받은 수 (UNIQUE 때문에 항상 0) |
 
+`count_match` 는 `issued_quantity` 를 Redis 재고에서 파생시키던 시절에는
+"Redis 가 센 수와 DB 에 들어간 수의 교차 검증" 이었다. `queue-mem` 에서는 워커의 상대적 `+1` 과
+동기화기의 절대 덮어쓰기가 같은 열을 건드리므로, 드레인 후 수렴한 값을 볼 뿐이다.
+
 **이 검증만으로는 부족하다.** 세 컬럼 모두 DB 안에서만 계산되므로,
-Redis 재고가 새는 과소발급을 잡지 못한다 (실제로 놓친 적이 있다 — §12.2).
-발급 후 `docker compose exec redis redis-cli GET coupon:1:stock` 이
-`total_quantity − 발급 수` 와 맞는지 같이 보는 것이 좋다.
+Redis 재고가 새는 과소발급을 잡지 못한다 (실제로 놓친 적이 있다 —
+[`load-test-k6.md` §12.2](load-test-k6.md)). 그래서 응답시간 트랙의 `verify-burst.ps1` 은
+`coupon:{id}:stock` 이 `total_quantity − 발급 수` 와 맞는지 매번 같이 출력한다.
+정확성 트랙에서 재고를 직접 보려면:
+
+```powershell
+docker compose exec redis redis-cli GET coupon:1:stock
+```
 
 ---
 
@@ -264,16 +324,31 @@ Redis 재고가 새는 과소발급을 잡지 못한다 (실제로 놓친 적이
 `checks 100%` 가 뜨는 상황이 실제로 있었다 → [`load-test-k6.md` §8.2](load-test-k6.md)
 
 **`reset.ps1` 은 Redis 도 `FLUSHALL` 한다. 빼지 말 것.** TRUNCATE 로 `coupon.id` 가 1부터
-다시 시작하므로, 비우지 않으면 이전 실행이 남긴 `coupon:1:issued` 집합을 그대로 물려받아
+다시 시작하므로, 비우지 않으면 이전 실행이 남긴 `coupon:1:users` 집합을 그대로 물려받아
 두 번째 실행부터 모든 요청이 "이미 발급" 으로 튕긴다(발급 0건). 재고 키만 쓰던 시절에는
 `initStock` 이 덮어써 줘서 이 문제가 드러나지 않았다.
+
+**측정 중에 `coupon-service` 컨테이너를 재시작하지 않는다.** 큐가 JVM 안에 있어서
+남아 있던 이벤트가 통째로 사라진다. Redis 재고는 이미 차감된 뒤라 그만큼 과소발급이 된다.
+`response/windows/run.ps1` 이 k6 을 `docker compose run --rm --no-deps` 로 부르는 이유가
+이것이다 — `--no-deps` 가 없으면 compose 가 `depends_on` 을 따라 앱 컨테이너를 건드릴 수 있고,
+그러면 큐가 비워지는 데다 워밍업으로 데운 JVM 도 식는다. 스크립트가 끝에 컨테이너 ID 를
+대조해 재생성 여부를 알려준다.
+
+**새로 만드는 `.ps1` 에는 UTF-8 BOM 을 붙인다.** PowerShell 5.1 은 BOM 이 없으면 파일을
+시스템 코드페이지(한국어 Windows 면 CP949)로 읽어 한글 주석이 깨지고, 운이 나쁘면
+따옴표가 어긋나 **파싱 에러**가 난다. 기존 스크립트가 전부 BOM 을 달고 있는 이유다.
 
 **부하가 끝난 직후에 `count_match` 를 재면 안 된다.** `issued_quantity` 는 1초 주기로
 따라오는 파생 값이라 아직 못 따라온 값을 보고 FAIL 이 뜬다. `load-test.ps1` 이
 검증 전에 3초 기다리는 이유다. 결함이 아니라 측정 시점 문제다.
 
-**mac 판 스크립트(`scripts/load/`)와 `scripts/api.sh` 는 `/api/coupons` 를 호출한다.**
+**mac 판 스크립트와 `scripts/concurrency/api.sh` 는 `/api/coupons` 를 호출한다.**
 실제 컨트롤러 경로는 `/api/v1/coupons` 라 그대로 돌리면 전부 404 다. Windows 판에만 반영되어 있다.
+
+**k6 컨테이너에는 `./scripts` 를 통째로 마운트한다.** 트랙별 하위 디렉터리를 각각 마운트하면
+디렉터리를 옮길 때마다 조용히 깨진다 — 실제로 한 번 깨졌다. 없는 호스트 경로를 마운트하면
+Docker 가 **빈 디렉터리를 만들어 주기 때문에** 에러가 아니라 "스크립트가 없다" 로 나타난다.
 
 **Windows 에서 호스트 → 앱 호출은 `localhost` 가 아니라 `127.0.0.1` 을 쓴다.**
 `localhost` 가 IPv6 `::1` 로 먼저 해석되는데 Docker Desktop 의 그 경로가 응답 없이 멈추는 경우가 있어,
@@ -283,22 +358,27 @@ Redis 재고가 새는 과소발급을 잡지 못한다 (실제로 놓친 적이
 
 ## 8. 현재 병목
 
-병목은 두 번 옮겨 다녔다.
+병목은 세 번 옮겨 다녔고, 마지막에는 **응답 경로 밖으로** 나갔다.
 
 | 단계 | 병목 | 상한 |
 |---|---|---:|
 | naive / pessimistic / lua / lua-gate | `coupon` 단일 행 UPDATE 의 직렬화 | ~290건/초 |
 | lua-wb | Hikari 커넥션 풀 기본값 10개 | ~2,700건/초 |
-| **lua-pool (현재)** | **미확정.** Tomcat 스레드 200개가 다음 용의자 | **~4,000건/초** |
+| lua-pool | **미확정.** Tomcat 스레드 200개가 용의자였다 | ~4,000건/초 |
+| **queue-mem (현재)** | **응답 경로에는 없다.** 부하 상한에 먼저 걸린다 | **5,000건/초 (부하 상한)** |
+| " | 대신 **워커의 DB 쓰기** 가 새 병목이다 | **~155건/초** |
 
-행 락을 없애자 커넥션 수가, 커넥션을 늘리자 그 다음이 드러났다.
-근거와 계산은 [`load-test-k6.md` §12.4, §12.7](load-test-k6.md).
+행 락을 없애자 커넥션 수가, 커넥션을 늘리자 그 다음이 드러났고,
+쓰기를 큐 뒤로 밀자 응답 경로에서는 아예 사라졌다.
+근거와 계산은 [`load-test-k6.md` §12.4, §12.7, §13](load-test-k6.md).
 
-부하는 `constant-arrival-rate` 5,000/s 인 열린 모델이라 여전히 요청의 15% 안팎이
-연결 수락 큐를 넘겨 TCP 단에서 튕긴다(`connection refused`). 다만 부하 전달률이
-73% → 94% 로 올라오면서 `http_reqs` 와 `dropped_iterations` 를 조건부로 읽을 수 있게 됐다
-(조건은 §9 참고). 구현 비교에는 계속 **"앱에 도달한 요청 수"** 를 쓴다.
+**`queue-mem` 에서 부하가 처음으로 100% 전달됐다.** `dropped_iterations` 0,
+`vus_max` 가 상한(5,000)에 붙지 않음, `status 0` 0건. 그래서 §9 의 신뢰 조건을 여유 있게
+만족하고, 연결 거부가 열린 모델 탓이라던 진단도 뒤집혔다 — 앱이 못 따라간 결과였다.
 
-Tomcat 스레드를 올리기 전에 **닫힌 모델(`shared-iterations`) 전환이 먼저다**
-([§11](load-test-k6.md)). 열린 모델로 5,000rps 를 계속 던지는 한 앱을 아무리 빠르게 해도
-accept 큐는 넘치고, 그러면 스레드를 올린 효과가 연결 거부에 묻힌다.
+지금 답이 없는 질문 둘.
+
+- **응답 p99 5.61ms 가 앱의 상한인가?** 모른다. 부하 상한에 먼저 걸렸다.
+  더 세게 걸면 알 수 있지만 그러면 12절까지의 기록과 비교가 깨진다
+- **쓰기 155건/초는 워커가 하나여서인가, `incrementIssueQuantity` 의 행 경합 때문인가?**
+  아직 안 갈랐다. 태그를 나눠 하나씩 바꿔 재면 나온다

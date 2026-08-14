@@ -2,7 +2,7 @@
 // 사용자 1,000명이 30초 동안 초당 5,000번 요청 → 같은 사람이 여러 번 시도하게 됨.
 // coupon.issued_quantity 와 실제 issuance 행 수가 다르면 발급 처리 중 race 가 일어난 것.
 //
-// scripts/load/duplicate_issuance.js (mac 로컬 k6 용) 의 Windows/Docker 판본.
+// scripts/concurrency/load/duplicate_issuance.js (mac 로컬 k6 용) 의 Windows/Docker 판본.
 // 부하 조건(rate, VU, USER_POOL)은 두 판본이 같아야 결과를 비교할 수 있다.
 import http from 'k6/http';
 import { check } from 'k6';
