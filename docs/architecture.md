@@ -7,7 +7,7 @@
 [`domain-model.md`](domain-model.md), 테이블 정의는 [`db-schema.md`](db-schema.md) 에 있다.
 여기서는 그 숫자들을 다시 적지 않고 가리키기만 한다.
 
-기준 시점: 2026-08-14, `coupon-service:queue-mem` 측정 직후.
+기준 시점: 2026-08-15, `coupon-service:kafka` 측정 직후 (`kafka-restore` 수정 반영).
 
 ---
 
@@ -21,7 +21,7 @@
 - `application.yaml` 이 쿼리 로그를 켜 두고 있다 (개발 중 SQL 을 보려고)
 
 **구현 전환은 브랜치가 아니라 이미지 태그로 한다.** `naive`, `pessimistic`, `lua`,
-`lua-fix`, `lua-gate`, `lua-wb`, `lua-pool`, `queue-mem` 을 같은 소스 트리에서 번갈아 빌드해
+`lua-fix`, `lua-gate`, `lua-wb`, `lua-pool`, `queue-mem`, `kafka` 를 같은 소스 트리에서 번갈아 빌드해
 태그만 다르게 붙인다 (각각이 무엇인지는 §5). 브랜치로 나누면 스크립트·문서를 고칠 때마다
 여러 곳에 포팅해야 하고, 서로 다른 하네스로 잰 수치는 비교가 성립하지 않기 때문이다.
 
@@ -52,34 +52,39 @@ CouponController.issue
        ├─ coupon.isBookingOpen(now)          시작 전이면 NOT_STARTED
        ├─ couponIssuer.tryIssue              Redis Lua — 발급 자격 판정이 여기서 원자적으로 끝난다
        │                                       SOLD_OUT / ALREADY_ISSUED 는 여기서 예외로 끝
-       └─ eventPublisher.publishEvent        이벤트만 던지고 곧바로 200 을 반환한다
+       └─ issuanceRequestProducer.publish    Kafka 에 던지고 곧바로 200 을 반환한다
+            └─ whenComplete { 실패하면 → couponIssuer.restore }   재고를 되돌린다
 
-  ⤷ IssuanceEventHandler — @Async @EventListener, 전용 스레드 풀 1개가 큐를 비운다
+  ⤷ IssuanceWorker — @KafkaListener(concurrency=3), 컨슈머 3개가 파티션 하나씩
        └─ IssuanceWriter.write                UNIQUE 위반은 멱등 처리로 삼키고 넘어간다
             └─ IssuanceTransactionWriter.insertAndIncrement   @Transactional
                  ├─ issuanceRepository.save                     INSERT issuance
-                 └─ couponRepository.incrementIssueQuantity     UPDATE coupon
+                 └─ couponRepository.incrementIssueQuantity     UPDATE coupon  ← 지금 병목
 ```
 
 **판정은 Redis, 기록은 큐 뒤의 워커** 로 나뉘어 있는 것이 이 구조의 핵심이다.
 경합이 몰리는 자리(재고 차감, 1인 1매)는 전부 Redis 의 Lua 스크립트 안에 있고,
-DB 쓰기는 응답 경로에서 빠져 있다. 그래서 사용자 응답 p99 가 705ms → 5.61ms 가 됐다
-([`load-test-k6.md` §13.3](load-test-k6.md)).
+DB 쓰기는 응답 경로에서 빠져 있다. 그래서 사용자 응답 p99 가 705ms → 5.95ms 가 됐다
+([`load-test-k6.md` §14.2](load-test-k6.md)).
 
-큐는 `AsyncIssuanceConfig` 의 `ThreadPoolTaskExecutor` 안에 있다
-(`corePoolSize=1, maxPoolSize=1, queueCapacity=10_000`).
-**큐가 꽉 차면 500 이 나간다** — 예전 `QueueFullException`(503)은 없어졌고,
-`ThreadPoolTaskExecutor` 의 기본 거부 정책이 `AbortPolicy` 라 `TaskRejectedException` 이 뜬다.
-게이트 통과가 5,000 이고 용량이 10,000 이라 정상 조건에서는 닿지 않는다.
+**큐는 이제 JVM 밖에 있다.** Kafka 토픽 `issuance.requested` (파티션 3, 키는 `userId`).
+힙 큐 시절의 용량 상한(10,000)과 `TaskRejectedException`(500)은 없어졌다 — 브로커 디스크가
+받아 주고, 프로세스가 죽어도 메시지가 남는다. 대신 **파티션 3개가 소비 병렬도의 상한**이고
+(`KafkaTopicConfig`), 새 실패 모드가 하나 생겼다 — `publish` 가 실패하면 Redis 재고는
+이미 깎인 뒤다. 그래서 `whenComplete` 에서 `restore` 로 되돌린다 (§4).
 
 **중요한 것은 200 OK 가 "발급 완료" 가 아니라 "접수 완료" 라는 점이다.** 응답 본문의
 `id` 는 아직 저장 전이라 `null` 이고, 실제 행은 워커가 나중에 쓴다. 5,000건을 다 쓰는 데
-부하 종료 후 9초가 더 걸린다 (초당 약 155행 — [`load-test-k6.md` §13.5](load-test-k6.md)).
+부하 종료 후 9초가 더 걸린다 (약 157행/틱 — [`load-test-k6.md` §14.5](load-test-k6.md)).
 
 `coupon.issued_quantity` 를 **두 곳에서 쓴다.** 워커가 이벤트마다 `+1` 하고,
 `IssuedQuantitySynchronizer` 가 1초마다 `total_quantity − (Redis 재고)` 로 덮어쓴다.
 드레인이 끝나면 둘 다 같은 값으로 수렴하지만, 이 열이 검증에서 잡아주는 것은 이제 없다
 ([`load-test-k6.md` §13.6](load-test-k6.md)).
+
+**그리고 워커의 `+1` 은 동기화기의 덮어쓰기에 매초 지워진다 — 결과에 기여하지 않는다.**
+그러면서 컨슈머 셋을 `coupon` 단일 행 락에 줄 세운다. 지금 쓰기 처리량의 상한으로 지목된
+자리이고, 다음 실험이 이 한 줄을 빼는 것이다 ([`load-test-k6.md` §14.6](load-test-k6.md)).
 
 예외는 전부 `support/DomainException.kt` 의 sealed 계층이고,
 `support/GlobalExceptionHandler.kt` 가 RFC 9457 ProblemDetail 로 변환한다.
@@ -101,16 +106,21 @@ src/main/kotlin/com/example/coupon/
     UserIssuanceController.kt   내 발급 내역 조회
     dto/                        요청·응답 DTO (from() 팩토리로 엔티티 변환)
   application/
-    CouponService.kt            발급 흐름. 조회 → 게이트 통과 → 큐에 넣고 즉시 반환
+    CouponService.kt            발급 흐름. 조회 → 게이트 통과 → 발행하고 즉시 반환.
+                                  발행 실패 시 restore 로 재고를 되돌리는 것도 여기
     CouponIssuer.kt             Redis Lua 호출 래퍼. tryIssue / restore / initStock
     IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
     IssuanceService.kt          사용/조회
   infrastructure/messaging/
-    AsyncIssuanceConfig.kt      전용 ThreadPoolTaskExecutor (스레드 1, 큐 10,000)
+    IssuanceTopics.kt           토픽·컨슈머그룹 이름 상수
     IssuanceRequested.kt        발행되는 이벤트 (couponId, userId, 발급/만료 시각)
-    IssuanceEventHandler.kt     @Async @EventListener — 그 풀에서 write 를 호출한다
+    IssuranceRequestProducer.kt 프로듀서. future 를 삼키지 않고 그대로 돌려준다 (파일명 오타)
+    IssuanceWorker.kt           @KafkaListener(concurrency=3) — write 를 호출한다
     IssuanceWriter.kt           쓰기 진입점. UNIQUE 위반을 멱등 처리로 삼킨다
     IssuanceTransactionWriter.kt  실제 @Transactional 경계. INSERT + 카운터 UPDATE
+    KafkaConfig.kt              프로듀서/컨슈머 팩토리. Jackson 3 직렬화, max.block.ms 3초
+    KafkaTopicConfig.kt         토픽 선언 (파티션 3 — 소비 병렬도의 상한)
+    KafkaErrorHandlerConfig.kt  재시도 1초 x 3회 → <topic>.DLT
   domain/
     Coupon.kt                   재고 총량 + 발급 카운터
     Issuance.kt                 발급 1건
@@ -123,6 +133,7 @@ src/main/kotlin/com/example/coupon/
 src/main/resources/
   application.yaml              개발 기본값 (쿼리 로그 켜짐) + Hikari 풀 크기 50
   lua/issue.lua                 Redis 원자 재고 차감
+  lua/restore.lua               그 짝. 되돌리기 (SREM 성공 시에만 INCR — 멱등)
 ```
 
 ---
@@ -155,7 +166,7 @@ src/main/resources/
 | 키 | 타입 | 누가 만드나 |
 |---|---|---|
 | `coupon:{id}:stock` | String (정수) | `CouponIssuer.initStock` — 쿠폰 생성 시 `total_quantity` 로 초기화 |
-| `coupon:{id}:users` | Set (userId) | `issue.lua` 가 발급 성공 시 `SADD` |
+| `coupon:{id}:users` | Set (userId) | `issue.lua` 가 발급 성공 시 `SADD`, `restore.lua` 가 `SREM` |
 
 **재고의 진실은 DB 가 아니라 Redis 에 있다.** `resources/lua/issue.lua` 한 스크립트가
 중복 여부와 재고를 함께 판정하고 그 자리에서 차감한다.
@@ -166,16 +177,21 @@ Redis 는 싱글 스레드라 **명령 하나는 그 자체로 원자적**이다
 Lua 스크립트는 이 여러 명령을 **Redis 서버 안에서 한 덩어리로** 실행해 그 틈을 없앤다.
 **Lua 를 쓰는 이유는 속도가 아니라 이 원자성이다.**
 
-Redis 는 DB 트랜잭션 밖이므로 차감 뒤 DB 쓰기가 실패해도 저절로 돌아오지 않는다.
-**지금 그 보상이 없다.** 워커가 예외를 만나면 로그만 찍고 이벤트를 버리며,
-`CouponIssuer.restore` 는 남아 있지만 부르는 곳이 없다 (게다가 키 이름이 `:issued` 인 채라
-그대로 쓰면 동작하지 않는다). 인메모리 큐라 프로세스가 죽어도 같은 일이 생긴다.
-
-보상이 없으면 그 한 장은 아무에게도 가지 않은 채 사라진다 —
-실제로 `lua` 태그에서 1,000명 시나리오 한 번에 23장이 샜고,
+Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저절로 돌아오지 않는다.
+보상이 없으면 그 한 장은 아무에게도 가지 않은 채 사라지고, 그 사용자는 `:users` 집합에 남아
+다시 시도해도 영영 거절된다. 실제로 `lua` 태그에서 1,000명 시나리오 한 번에 23장이 샜고,
 **DB 만 보는 검증은 그것을 OK 로 통과시켰다** ([`load-test-k6.md` §12.2](load-test-k6.md)).
-`queue-mem` 측정 두 라운드에서는 누수가 0 이었지만, 막혀 있어서가 아니라 안 터졌을 뿐이다.
 `scripts/response/windows/verify-burst.ps1` 이 매번 Redis 잔여 재고를 같이 출력하는 이유다.
+
+**지금 보상은 발행 실패 경로에만 있다** (`kafka-restore`, [§14.7·§15](load-test-k6.md)).
+`CouponService.issue` 가 `publish` 의 future 를 받아 실패하면 `restore.lua` 로 되돌린다.
+`restore.lua` 는 `SREM` 이 실제로 지웠을 때만 `INCR` 하므로 두 번 불려도 안전하다.
+(`kafka` 태그까지는 이 경로가 없었고, `CouponIssuer.restore` 는 `:issued` 라는
+존재하지 않는 키를 지우고 있어 불러도 반쪽만 돌아갔다.)
+
+**아직 안 막힌 자리 둘.** 워커가 DB 쓰기에서 예외를 만나면 재시도 3회 뒤 DLT 로 가고 재고는
+그대로 남는다. 그리고 ack 이 애매하게 실패하면 보상이 과잉이 되어 총량을 넘길 수 있다
+([`load-test-k6.md` §15.3](load-test-k6.md)).
 
 ---
 
@@ -192,8 +208,10 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤 DB 쓰기가 실패해도 저�
 | `lua-gate` | Lua 게이트를 DB 접근 **앞으로** | 위와 같음 | OK | ~252/s |
 | `lua-wb` | Lua 게이트가 맨 앞 | 동기 INSERT, 카운터는 write-behind | OK | ~2,700/s |
 | `lua-pool` | 위와 같음 | 위와 같음 (Hikari 풀 10 → 50) | OK | ~4,000/s |
-| `queue-mem` | 게이트가 DB 조회 **뒤로** 돌아옴 | **인메모리 큐 + 워커 1개 (비동기)** | OK | 응답 5,000/s · 쓰기 ~155/s |
-| **`queue-async` (현재)** | 위와 같음 | 위와 같음, 단 Spring `@Async` + 이벤트로 | OK | **응답 5,000/s · 쓰기 ~155/s** |
+| `queue-mem` | 게이트가 DB 조회 **뒤로** 돌아옴 | **인메모리 큐 + 워커 1개 (비동기)** | OK | 응답 5,000/s · 쓰기 ~155/틱 |
+| `queue-async` | 위와 같음 | 위와 같음, 단 Spring `@Async` + 이벤트로 | OK | 응답 5,000/s · 쓰기 ~155/틱 |
+| `kafka` | 위와 같음 | **Kafka (파티션 3, 컨슈머 3)** | OK (발행 실패 시 유실) | 응답 5,000/s · 쓰기 ~157/틱 |
+| **`kafka-restore` (현재)** | 위와 같음 | 위와 같음 + **발행 실패 시 재고 보상** | OK | **응답 5,000/s · 쓰기 ~157/틱** |
 
 `pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있다.
 
@@ -208,14 +226,19 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 (p99 5.62 → 5.59ms). 풀 설정이 앞 구현과 특성이 같으니 그렇다.
 **프레임워크로 옮긴 것은 코드가 줄어든 것이지 성능이 달라진 것이 아니다.**
 
-처리량 칸이 둘로 갈라진 것이 이 두 구현의 성격을 그대로 말한다.
-사용자 응답은 부하 상한(5,000/s)을 그대로 소화하는데 DB 쓰기는 초당 155건이다.
-**큐는 병목을 없앤 것이 아니라 사용자 응답 밖으로 옮겼다.** 워커가 단일 스레드인 데다
+`kafka` 도 같은 성격의 관찰을 하나 더 준다. **큐를 프로세스 밖으로 내보내고 소비자를 3배로
+늘렸는데 쓰기 처리량이 155 → 157 로 안 움직였다.** 파티션 쏠림이 아니라는 것은 브로커의
+종료 오프셋(33.6 / 33.5 / 32.9%)으로 확인했다. **병목이 큐에도, 소비자 수에도 없다는 뜻이다.**
+얻은 것은 성능이 아니라 내구성(프로세스가 죽어도 메시지가 남는다)과 DLT 다.
+
+처리량 칸이 둘로 갈라진 것이 이 구현들의 성격을 그대로 말한다.
+사용자 응답은 부하 상한(5,000/s)을 그대로 소화하는데 DB 쓰기는 157/틱이다.
+**큐는 병목을 없앤 것이 아니라 사용자 응답 밖으로 옮겼다.**
 `incrementIssueQuantity`(= `coupon` 단일 행 UPDATE)가 워커 안으로 되돌아온 탓이다 —
 `lua-wb` 에서 10배를 만들어 준 그 쿼리가 자리만 바꿔 다시 들어와 있다.
 
-자세한 분석은 [`load-test-k6.md` §12](load-test-k6.md)(동기 구현들)과
-[§13](load-test-k6.md)(큐 디커플링).
+자세한 분석은 [`load-test-k6.md` §12](load-test-k6.md)(동기 구현들),
+[§13](load-test-k6.md)(큐 디커플링), [§14–15](load-test-k6.md)(Kafka).
 
 ---
 
@@ -261,7 +284,10 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 
 ### compose 구성 (`docker-compose.yml`)
 
-- `mysql` 8.4, `redis` 8.0 (AOF 켜짐), `coupon-service`, `k6`
+- `mysql` 8.4, `redis` 8.0 (AOF 켜짐), `kafka`, `coupon-service`, `k6`
+- `kafka` 는 `apache/kafka:3.8.0` 을 **KRaft 모드**로 띄운다 — ZooKeeper 컨테이너가 없다.
+  볼륨을 안 붙였으므로 `docker compose down` 하면 토픽과 오프셋이 같이 사라진다.
+  `coupon-service` 가 `condition: service_healthy` 로 기다리므로 기동이 그만큼 늦다
 - `coupon-service` 의 이미지 태그는 `${COUPON_IMAGE_TAG:-latest}` — `.env` 에서 온다
 - `k6` 는 `profiles: ["load"]` 라 평소 `up -d` 에는 뜨지 않고,
   `docker compose run --rm k6 …` 로 명시 실행할 때만 뜬다.
@@ -338,8 +364,13 @@ docker compose exec redis redis-cli GET coupon:1:stock
 두 번째 실행부터 모든 요청이 "이미 발급" 으로 튕긴다(발급 0건). 재고 키만 쓰던 시절에는
 `initStock` 이 덮어써 줘서 이 문제가 드러나지 않았다.
 
-**측정 중에 `coupon-service` 컨테이너를 재시작하지 않는다.** 큐가 JVM 안에 있어서
-남아 있던 이벤트가 통째로 사라진다. Redis 재고는 이미 차감된 뒤라 그만큼 과소발급이 된다.
+**측정 중에 `coupon-service` 컨테이너를 재시작하지 않는다 — 다만 위험의 방향이 뒤집혔다.**
+인메모리 큐 시절에는 재시작하면 큐에 남은 이벤트가 통째로 사라져 **과소발급**이 됐다.
+Kafka 는 반대다. **메시지가 남는다.** 그래서 이제 위험은 유실이 아니라 **오염**이다 —
+드레인이 안 끝난 채 리셋(TRUNCATE + `FLUSHALL`)하면, 다음 라운드에서 컨슈머가 이전 라운드
+메시지를 마저 먹고 새 `coupon.id=1` 에 행을 쓴다. **`reset.ps1` 은 토픽을 비우지 않는다.**
+지금은 `verify-burst.ps1` 의 드레인 폴링이 매 라운드 토픽을 다 비우고 나서 다음 리셋이
+돌기 때문에 안 터진다. 폴링을 건드리거나 타임아웃(60초)에 걸리면 그 보호가 사라진다.
 `response/windows/run.ps1` 이 k6 을 `docker compose run --rm --no-deps` 로 부르는 이유가
 이것이다 — `--no-deps` 가 없으면 compose 가 `depends_on` 을 따라 앱 컨테이너를 건드릴 수 있고,
 그러면 큐가 비워지는 데다 워밍업으로 데운 JVM 도 식는다. 스크립트가 끝에 컨테이너 ID 를
@@ -382,20 +413,28 @@ Docker 가 **빈 디렉터리를 만들어 주기 때문에** 에러가 아니�
 | naive / pessimistic / lua / lua-gate | `coupon` 단일 행 UPDATE 의 직렬화 | ~290건/초 |
 | lua-wb | Hikari 커넥션 풀 기본값 10개 | ~2,700건/초 |
 | lua-pool | **미확정.** Tomcat 스레드 200개가 용의자였다 | ~4,000건/초 |
-| **queue-mem / queue-async (현재)** | **응답 경로에는 없다.** 부하 상한에 먼저 걸린다 | **5,000건/초 (부하 상한)** |
-| " | 대신 **워커의 DB 쓰기** 가 새 병목이다 | **~155건/초** |
+| queue-mem / queue-async | **응답 경로에는 없다.** 부하 상한에 먼저 걸린다 | 5,000건/초 (부하 상한) |
+| " | 대신 **워커의 DB 쓰기** 가 새 병목이다 | ~155/틱 |
+| **kafka / kafka-restore (현재)** | 응답 경로는 그대로 부하 상한 | **5,000건/초 (부하 상한)** |
+| " | **소비자를 3배로 늘려도 쓰기는 그대로다** | **~157/틱** |
 
 행 락을 없애자 커넥션 수가, 커넥션을 늘리자 그 다음이 드러났고,
 쓰기를 큐 뒤로 밀자 응답 경로에서는 아예 사라졌다.
-근거와 계산은 [`load-test-k6.md` §12.4, §12.7, §13](load-test-k6.md).
+근거와 계산은 [`load-test-k6.md` §12.4, §12.7, §13, §14](load-test-k6.md).
 
 **`queue-mem` 에서 부하가 처음으로 100% 전달됐다.** `dropped_iterations` 0,
 `vus_max` 가 상한(5,000)에 붙지 않음, `status 0` 0건. 그래서 §9 의 신뢰 조건을 여유 있게
 만족하고, 연결 거부가 열린 모델 탓이라던 진단도 뒤집혔다 — 앱이 못 따라간 결과였다.
 
+**"워커가 하나여서인가" 는 닫혔다.** `kafka` 에서 소비자를 3개로 늘렸는데 쓰기가
+155 → 157 로 안 움직였다. 파티션 쏠림이 아닌 것은 브로커 오프셋으로, CPU 문제가 아닌 것은
+워밍업과 본 측정의 드레인 속도가 같다는 것으로 확인했다
+([`load-test-k6.md` §14.5](load-test-k6.md)).
+
 지금 답이 없는 질문 둘.
 
-- **응답 p99 5.61ms 가 앱의 상한인가?** 모른다. 부하 상한에 먼저 걸렸다.
+- **응답 p99 ~5.9ms 가 앱의 상한인가?** 모른다. 부하 상한에 먼저 걸렸다.
   더 세게 걸면 알 수 있지만 그러면 12절까지의 기록과 비교가 깨진다
-- **쓰기 155건/초는 워커가 하나여서인가, `incrementIssueQuantity` 의 행 경합 때문인가?**
-  아직 안 갈랐다. 태그를 나눠 하나씩 바꿔 재면 나온다
+- **쓰기 157/틱을 잡고 있는 것은 `coupon` 단일 행 UPDATE 인가, 커밋당 fsync 인가?**
+  다음 태그에서 `incrementIssueQuantity` **한 줄만** 빼고 재면 갈린다.
+  오르면 앞엣것, 안 오르면 뒤엣것이고 그때는 배치가 다음 레버다

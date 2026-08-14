@@ -35,6 +35,9 @@ class KafkaConfig(
         val props = mapOf<String, Any>(
             ProducerConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers,
             ProducerConfig.ACKS_CONFIG to "1",
+            // 기본값이 60초다. 브로커가 죽으면 발급 요청마다 Tomcat 스레드가 60초씩 묶여
+            // 앱 전체가 같이 멈춘다. 실패는 빨리 드러나야 보상도 빨리 돈다.
+            ProducerConfig.MAX_BLOCK_MS_CONFIG to 3_000,
         )
         return DefaultKafkaProducerFactory(props, StringSerializer(), JacksonJsonSerializer<Any>(jsonMapper))
     }
@@ -51,7 +54,7 @@ class KafkaConfig(
             ConsumerConfig.AUTO_OFFSET_RESET_CONFIG to "earliest",
         )
         val jsonDelegate = JacksonJsonDeserializer(IssuanceRequested::class.java, jsonMapper).apply {
-            addTrustedPackages("com.apiece.coupon.infrastructure.messaging")
+            addTrustedPackages("com.example.coupon.infrastructure.messaging")
         }
         @Suppress("UNCHECKED_CAST")
         val valueDeserializer = ErrorHandlingDeserializer(jsonDelegate) as ErrorHandlingDeserializer<Any>
