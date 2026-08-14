@@ -57,10 +57,14 @@ CouponController.issue
 
   ⤷ IssuanceWorker — @KafkaListener(concurrency=3), 컨슈머 3개가 파티션 하나씩
        └─ IssuanceWriter.write                UNIQUE 위반은 멱등 처리로 삼키고 넘어간다
-            └─ IssuanceTransactionWriter.insertAndIncrement   @Transactional
-                 ├─ issuanceRepository.save                     INSERT issuance
-                 └─ couponRepository.incrementIssueQuantity     UPDATE coupon  ← 지금 병목
+            └─ IssuanceTransactionWriter.insert               @Transactional
+                 └─ issuanceRepository.save                     INSERT issuance 뿐이다
 ```
+
+**워커에는 `coupon` 행을 건드리는 쿼리가 없다.** 예전에는 여기서 `incrementIssueQuantity` 를
+같이 쳤는데, 그 값은 `IssuedQuantitySynchronizer` 가 매초 덮어써서 결과에 기여하지 않으면서
+컨슈머들을 단일 행 락에 줄 세우기만 했다. 빼자 부하 종료 후 드레인이 통째로 사라졌다
+([`load-test-k6.md` §16](load-test-k6.md)).
 
 **판정은 Redis, 기록은 큐 뒤의 워커** 로 나뉘어 있는 것이 이 구조의 핵심이다.
 경합이 몰리는 자리(재고 차감, 1인 1매)는 전부 Redis 의 Lua 스크립트 안에 있고,
@@ -75,16 +79,14 @@ DB 쓰기는 응답 경로에서 빠져 있다. 그래서 사용자 응답 p99 �
 
 **중요한 것은 200 OK 가 "발급 완료" 가 아니라 "접수 완료" 라는 점이다.** 응답 본문의
 `id` 는 아직 저장 전이라 `null` 이고, 실제 행은 워커가 나중에 쓴다. 5,000건을 다 쓰는 데
-부하 종료 후 9초가 더 걸린다 (약 157행/틱 — [`load-test-k6.md` §14.5](load-test-k6.md)).
+**얼마나 뒤에 앉는지는 지금 못 잰다.** `kafka-nocount` 부터는 5,000행이 부하 구간 안에서
+다 들어가서, 부하 종료 후 드레인 폴링에 아무것도 안 잡힌다. "≥160/s" 이상은 말할 수 없다
+([`load-test-k6.md` §16.2](load-test-k6.md)).
 
-`coupon.issued_quantity` 를 **두 곳에서 쓴다.** 워커가 이벤트마다 `+1` 하고,
-`IssuedQuantitySynchronizer` 가 1초마다 `total_quantity − (Redis 재고)` 로 덮어쓴다.
-드레인이 끝나면 둘 다 같은 값으로 수렴하지만, 이 열이 검증에서 잡아주는 것은 이제 없다
-([`load-test-k6.md` §13.6](load-test-k6.md)).
-
-**그리고 워커의 `+1` 은 동기화기의 덮어쓰기에 매초 지워진다 — 결과에 기여하지 않는다.**
-그러면서 컨슈머 셋을 `coupon` 단일 행 락에 줄 세운다. 지금 쓰기 처리량의 상한으로 지목된
-자리이고, 다음 실험이 이 한 줄을 빼는 것이다 ([`load-test-k6.md` §14.6](load-test-k6.md)).
+`coupon.issued_quantity` 는 **`IssuedQuantitySynchronizer` 만 쓴다.**
+1초마다 `total_quantity − (Redis 재고)` 로 덮어쓴다. 즉 이 열은 "Redis 가 센 발급 수" 이고,
+그래서 검증의 `count_match` 가 **Redis 와 DB 의 교차 검증**으로 되살아났다
+([`load-test-k6.md` §16.5](load-test-k6.md)).
 
 예외는 전부 `support/DomainException.kt` 의 sealed 계층이고,
 `support/GlobalExceptionHandler.kt` 가 RFC 9457 ProblemDetail 로 변환한다.
@@ -117,7 +119,7 @@ src/main/kotlin/com/example/coupon/
     IssuranceRequestProducer.kt 프로듀서. future 를 삼키지 않고 그대로 돌려준다 (파일명 오타)
     IssuanceWorker.kt           @KafkaListener(concurrency=3) — write 를 호출한다
     IssuanceWriter.kt           쓰기 진입점. UNIQUE 위반을 멱등 처리로 삼킨다
-    IssuanceTransactionWriter.kt  실제 @Transactional 경계. INSERT + 카운터 UPDATE
+    IssuanceTransactionWriter.kt  실제 @Transactional 경계. INSERT 하나뿐 (카운터는 안 건드린다)
     KafkaConfig.kt              프로듀서/컨슈머 팩토리. Jackson 3 직렬화, max.block.ms 3초
     KafkaTopicConfig.kt         토픽 선언 (파티션 3 — 소비 병렬도의 상한)
     KafkaErrorHandlerConfig.kt  재시도 1초 x 3회 → <topic>.DLT
@@ -211,7 +213,8 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저
 | `queue-mem` | 게이트가 DB 조회 **뒤로** 돌아옴 | **인메모리 큐 + 워커 1개 (비동기)** | OK | 응답 5,000/s · 쓰기 ~155/틱 |
 | `queue-async` | 위와 같음 | 위와 같음, 단 Spring `@Async` + 이벤트로 | OK | 응답 5,000/s · 쓰기 ~155/틱 |
 | `kafka` | 위와 같음 | **Kafka (파티션 3, 컨슈머 3)** | OK (발행 실패 시 유실) | 응답 5,000/s · 쓰기 ~157/틱 |
-| **`kafka-restore` (현재)** | 위와 같음 | 위와 같음 + **발행 실패 시 재고 보상** | OK | **응답 5,000/s · 쓰기 ~160/틱** |
+| `kafka-restore` | 위와 같음 | 위와 같음 + **발행 실패 시 재고 보상** | OK | 응답 5,000/s · 쓰기 ~160/틱 |
+| **`kafka-nocount` (현재)** | 위와 같음 | 위와 같음, 단 **워커에서 카운터 UPDATE 제거** | OK | **응답 5,000/s · 쓰기 ≥160/s (상한 미상)** |
 
 `pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있다.
 
@@ -231,14 +234,17 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 종료 오프셋(33.6 / 33.5 / 32.9%)으로 확인했다. **병목이 큐에도, 소비자 수에도 없다는 뜻이다.**
 얻은 것은 성능이 아니라 내구성(프로세스가 죽어도 메시지가 남는다)과 DLT 다.
 
-처리량 칸이 둘로 갈라진 것이 이 구현들의 성격을 그대로 말한다.
-사용자 응답은 부하 상한(5,000/s)을 그대로 소화하는데 DB 쓰기는 157/틱이다.
-**큐는 병목을 없앤 것이 아니라 사용자 응답 밖으로 옮겼다.**
-`incrementIssueQuantity`(= `coupon` 단일 행 UPDATE)가 워커 안으로 되돌아온 탓이다 —
-`lua-wb` 에서 10배를 만들어 준 그 쿼리가 자리만 바꿔 다시 들어와 있다.
+**그러면 무엇이 잡고 있었나 — `kafka-nocount` 가 답한다.** `incrementIssueQuantity`
+(= `coupon` 단일 행 UPDATE) 한 줄을 워커에서 빼자 부하 종료 후 드레인이 통째로 사라졌고,
+대신 응답 분포가 med 부터 p99 까지 한 방향으로 밀렸다(1.25 → 1.39ms, 6.45 → 11.74ms).
+둘 다 **"쓰기가 빨라져 부하 구간 안으로 들어왔다"** 하나로 설명된다.
+
+**`lua-wb` 에서 10배를 만들어 준 그 쿼리가 자리만 바꿔 워커 안에 다시 들어와 있었던 것이다.**
+경합 지점은 옮겨도 없어지지 않는다 — 어디에 있든 단일 행 UPDATE 는 그 경로의 상한이다.
+큐가 한 일은 그것을 **사용자 응답 밖으로** 옮긴 것까지다.
 
 자세한 분석은 [`load-test-k6.md` §12](load-test-k6.md)(동기 구현들),
-[§13](load-test-k6.md)(큐 디커플링), [§14–15](load-test-k6.md)(Kafka).
+[§13](load-test-k6.md)(큐 디커플링), [§14–16](load-test-k6.md)(Kafka·병목 확정).
 
 ---
 
@@ -300,12 +306,14 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 | 컬럼 | 뜻 |
 |---|---|
 | `over_issuance` | `issuance_rows > total_quantity` → FAIL. 전역 N장 보장이 깨짐 |
-| `count_match` | `issued_quantity = issuance_rows`. **지금은 의미가 옅다** — 아래 참고 |
+| `count_match` | `issued_quantity = issuance_rows`. **다시 의미가 있다** — 아래 참고 |
 | `duplicate_users` | 같은 사용자가 2장 이상 받은 수 (UNIQUE 때문에 항상 0) |
 
-`count_match` 는 `issued_quantity` 를 Redis 재고에서 파생시키던 시절에는
-"Redis 가 센 수와 DB 에 들어간 수의 교차 검증" 이었다. `queue-mem` 에서는 워커의 상대적 `+1` 과
-동기화기의 절대 덮어쓰기가 같은 열을 건드리므로, 드레인 후 수렴한 값을 볼 뿐이다.
+`count_match` 는 한동안 의미가 없었다. `queue-mem` ~ `kafka` 에서는 워커의 상대적 `+1` 과
+동기화기의 절대 덮어쓰기가 같은 열을 건드려서, 드레인 후 수렴한 값을 볼 뿐이었다.
+**`kafka-nocount` 에서 워커의 `+1` 을 빼면서 되살아났다** — 이제 `issued_quantity` 는
+`IssuedQuantitySynchronizer` 만 쓰는 "Redis 가 센 발급 수" 이므로, 이 비교는
+**Redis 와 DB 의 교차 검증**이다. FAIL 이 뜨면 진짜 신호다.
 
 **이 검증만으로는 부족하다.** 세 컬럼 모두 DB 안에서만 계산되므로,
 Redis 재고가 새는 과소발급을 잡지 못한다 (실제로 놓친 적이 있다 —
@@ -415,26 +423,32 @@ Docker 가 **빈 디렉터리를 만들어 주기 때문에** 에러가 아니�
 | lua-pool | **미확정.** Tomcat 스레드 200개가 용의자였다 | ~4,000건/초 |
 | queue-mem / queue-async | **응답 경로에는 없다.** 부하 상한에 먼저 걸린다 | 5,000건/초 (부하 상한) |
 | " | 대신 **워커의 DB 쓰기** 가 새 병목이다 | ~155/틱 |
-| **kafka / kafka-restore (현재)** | 응답 경로는 그대로 부하 상한 | **5,000건/초 (부하 상한)** |
-| " | **소비자를 3배로 늘려도 쓰기는 그대로다** | **~157/틱** |
+| kafka / kafka-restore | 응답 경로는 그대로 부하 상한 | 5,000건/초 (부하 상한) |
+| " | **소비자를 3배로 늘려도 쓰기는 그대로다** | ~157/틱 |
+| **kafka-nocount (현재)** | 그 쓰기를 잡던 것은 **`coupon` 단일 행 UPDATE** 였다 | **≥160/s, 상한 미상** |
+| " | **하네스가 못 잰다.** 드레인이 부하 구간 안에서 끝난다 | 측정 불가 |
 
 행 락을 없애자 커넥션 수가, 커넥션을 늘리자 그 다음이 드러났고,
 쓰기를 큐 뒤로 밀자 응답 경로에서는 아예 사라졌다.
-근거와 계산은 [`load-test-k6.md` §12.4, §12.7, §13, §14](load-test-k6.md).
+그리고 그 큐 뒤에 다시 나타난 것도 **같은 단일 행 UPDATE** 였다.
+근거와 계산은 [`load-test-k6.md` §12.4, §12.7, §13, §14, §16](load-test-k6.md).
 
 **`queue-mem` 에서 부하가 처음으로 100% 전달됐다.** `dropped_iterations` 0,
 `vus_max` 가 상한(5,000)에 붙지 않음, `status 0` 0건. 그래서 §9 의 신뢰 조건을 여유 있게
 만족하고, 연결 거부가 열린 모델 탓이라던 진단도 뒤집혔다 — 앱이 못 따라간 결과였다.
 
-**"워커가 하나여서인가" 는 닫혔다.** `kafka` 에서 소비자를 3개로 늘렸는데 쓰기가
-155 → 157 로 안 움직였다. 파티션 쏠림이 아닌 것은 브로커 오프셋으로, CPU 문제가 아닌 것은
-워밍업과 본 측정의 드레인 속도가 같다는 것으로 확인했다
-([`load-test-k6.md` §14.5](load-test-k6.md)).
+**쓰기 병목 질문은 닫혔다.** 소비자 수가 아니고(`kafka`, 3배로 늘려도 155 → 157),
+커밋당 fsync 도 아니다 — `coupon` 단일 행 UPDATE 한 줄을 빼자 드레인이 통째로 사라졌다
+(`kafka-nocount`, [`load-test-k6.md` §16.4](load-test-k6.md)).
 
-지금 답이 없는 질문 둘.
+지금 답이 없는 질문 셋.
 
-- **응답 p99 ~5.9ms 가 앱의 상한인가?** 모른다. 부하 상한에 먼저 걸렸다.
+- **하네스가 지금 구현을 못 잰다.** 드레인 폴링은 "부하가 끝난 뒤에도 계속 쓰는" 구현을
+  재려고 만든 것인데, `kafka-nocount` 는 부하 구간 안에서 다 끝낸다. **"≥160/s" 이상
+  말할 수 없다.** 부하 구간 안에서 실제 경과시간과 함께 샘플링하도록 고쳐야 하고,
+  그때 "틱당" 단위 문제도 같이 없어진다 ([`load-test-k6.md` §16.2](load-test-k6.md))
+- **응답 p99 가 6.45 → 11.74ms 로 밀린 이유를 아직 안 갈랐다.** 쓰기가 부하 구간 안으로
+  들어와 요청 경로와 자원을 다투는 것까지는 분명한데, 무엇을 다투는지(Hikari 풀? CPU?)는 모른다.
+  위 하네스를 고친 뒤에야 잴 수 있다
+- **응답 p99 가 앱의 상한인가?** 모른다. 부하 상한(5,000rps)에 먼저 걸렸다.
   더 세게 걸면 알 수 있지만 그러면 12절까지의 기록과 비교가 깨진다
-- **쓰기 157/틱을 잡고 있는 것은 `coupon` 단일 행 UPDATE 인가, 커밋당 fsync 인가?**
-  다음 태그에서 `incrementIssueQuantity` **한 줄만** 빼고 재면 갈린다.
-  오르면 앞엣것, 안 오르면 뒤엣것이고 그때는 배치가 다음 레버다

@@ -14,7 +14,8 @@ interface CouponRepository: JpaRepository<Coupon, Long> {
 //    fun findByIdForUpdate(@Param("id") id: Long): Coupon?
 
     // 발급 요청마다 이걸 부르면 모든 요청이 coupon 단일 행의 UPDATE 에서 직렬화된다.
-    // 핫패스에서는 더 이상 쓰지 않는다. 되돌려 비교할 때를 위해 남겨 둔다.
+    // 핫패스에서 뺐다가(lua-wb) 워커 안으로 되돌아왔고, 거기서도 뺐다(kafka-nocount).
+    // 지금은 부르는 곳이 없다 — 되돌려 비교할 때를 위해 남겨 둔다.
     @Modifying
     @Query("UPDATE Coupon c SET c.issuedQuantity = c.issuedQuantity + 1 WHERE c.id = :id")
     fun incrementIssueQuantity(@Param("id") id: Long): Int

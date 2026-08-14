@@ -7,6 +7,7 @@ import com.example.coupon.domain.Issuance
 import com.example.coupon.infrastructure.messaging.IssuanceRequestProducer
 import com.example.coupon.infrastructure.messaging.IssuanceRequested
 import com.example.coupon.support.CouponNotFoundException
+import com.example.coupon.support.IssuanceAcceptFailedException
 import com.example.coupon.support.NotStartedException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.springframework.stereotype.Service
@@ -67,9 +68,10 @@ class CouponService(
         }
         catch (e: Exception) {
             // send 가 즉시 던지는 경우 (직렬화 실패, 메타데이터 대기 초과 = max.block.ms).
-            // 되돌린 뒤 다시 던진다 — 사용자는 500 을 받고 재고는 보존된다.
+            // 되돌렸으므로 이 사용자는 지금 다시 시도하면 성공한다. 그래서 500 이 아니라 503 이다.
+            // 원인 예외는 compensate 안에서 ERROR 로그로 남으므로 여기서 흘려보내도 잃지 않는다.
             compensate(couponId, userId, e)
-            throw e
+            throw IssuanceAcceptFailedException()
         }
 
         return Issuance(

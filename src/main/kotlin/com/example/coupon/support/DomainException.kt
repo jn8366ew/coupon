@@ -7,7 +7,7 @@ sealed class DomainException(
     val code: String,
     val httpStatus: HttpStatus,
     message: String
-): RuntimeException(message)
+) : RuntimeException(message)
 
 class CouponNotFoundException(message: String = "쿠폰 행사를 찾을 수 없습니다") :
     DomainException("COUPON_NOT_FOUND", HttpStatus.NOT_FOUND, message)
@@ -32,3 +32,6 @@ class AlreadyUsedException(message: String = "이미 사용된 쿠폰입니다")
 
 class ExpiredException(message: String = "유효기간이 만료된 쿠폰입니다") :
     DomainException("EXPIRED", HttpStatus.CONFLICT, message)
+
+class IssuanceAcceptFailedException(message: String = "발급 요청을 접수하지 못했습니다. 잠시 후 다시 시도해주세요") :
+    DomainException("ISSUANCE_ACCEPT_FAILED", HttpStatus.SERVICE_UNAVAILABLE, message)

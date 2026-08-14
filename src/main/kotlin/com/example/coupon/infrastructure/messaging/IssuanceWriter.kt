@@ -23,7 +23,7 @@ class IssuanceWriter(
         // 이렇게 한 이유는 실패로 예를 그냥 밖으로 뱉어버리면 워커가 재처리를 계속하지 않길 원함
         // 중복 발급이니까.
         try {
-            transactional.insertAndIncrement(event)
+            transactional.insert(event)
         } catch (e: DataIntegrityViolationException) {
             log.debug { "UNIQUE 위반은 멱등 처리: couponId = ${event.couponId}, userId = ${event.userId}" }
         }
