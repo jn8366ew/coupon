@@ -1,0 +1,70 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: coupon
+      MYSQL_USER: coupon
+      MYSQL_PASSWORD: coupon
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  coupon-service:
+    # 어떤 구현을 띄울지는 태그로 고른다 (naive / pessimistic / ...).
+    # 값은 .env 의 COUPON_IMAGE_TAG 에서 오고, build-and-run 스크립트가 써 준다.
+    # compose 가 .env 를 자동으로 읽으므로 어느 셸에서 실행하든 같은 태그가 적용된다.
+    image: coupon-service:${COUPON_IMAGE_TAG:-latest}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/coupon
+      SPRING_DATASOURCE_USERNAME: coupon
+      SPRING_DATASOURCE_PASSWORD: coupon
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+    ports:
+      - "8080:8080"
+
+  # 부하 테스트 러너. profile 덕분에 `docker compose up -d` 로는 뜨지 않고,
+  # `docker compose run --rm k6 ...` 로 명시 실행할 때만 뜬다.
+  # 앱과 같은 네트워크 안에서 coupon-service 에 직접 붙으므로
+  # Windows/WSL2 의 포트포워딩(localhost:8080)을 거치지 않는다.
+  k6:
+    # 태그 고정. 세 브랜치(part-2-1/2-2/2-3) 결과를 비교하려면 러너가 동일해야 한다.
+    image: grafana/k6:2.2.0
+    profiles: ["load"]
+    depends_on:
+      - coupon-service
+    environment:
+      BASE_URL: http://coupon-service:8080
+    volumes:
+      # scripts/load 의 mac 로컬 k6 용 시나리오는 그대로 두고, Windows/Docker 판본을 쓴다.
+      - ./scripts/windows/k6:/scripts:ro
+      - ./build/k6:/out
+
+  redis:
+    image: redis:8.0
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  mysql-data:
+  redis-data:

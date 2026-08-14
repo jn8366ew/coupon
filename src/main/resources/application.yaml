@@ -1,0 +1,32 @@
+spring:
+  application:
+    name: coupon
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://localhost:3306/coupon}
+    username: ${SPRING_DATASOURCE_USERNAME:coupon}
+    password: ${SPRING_DATASOURCE_PASSWORD:coupon}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 기본값 10 은 이 워크로드에 맞지 않는다. Redis 게이트가 발급분 5,000건을 1초 안에
+      # 통과시키는데 커넥션이 10개뿐이라 전부 여기서 줄을 섰다 (성공 응답 4.45초의 정체).
+      # 50 으로 올려 1.32초가 됐다. docs/load-test-k6.md 12.7 절.
+      maximum-pool-size: 50
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+  jpa:
+    hibernate:
+      # 운영에서는 당연히 none으로
+      ddl-auto: update
+    open-in-view: false
+    show-sql: true
+  mvc:
+    problemdetails:
+      enabled: true
+
+logging:
+  level:
+    com.example.coupon: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.hibernate.orm.jdbc.bind: TRACE

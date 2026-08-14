@@ -1,0 +1,37 @@
+# 부하 테스트용 override. coupon-service 의 쿼리 로그를 끈다.
+#
+# 사용:
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d coupon-service
+#
+# 보통은 직접 칠 일이 없다. scripts/windows/load-test.ps1 이 알아서 적용하고 검증한다.
+# 개발 모드(쿼리 로그 켜짐)로 돌아가려면: docker compose up -d coupon-service
+#
+#
+# 왜 로그를 꺼야 하나
+#
+#   application.yaml 은 개발 중 쿼리를 보려고 show-sql 과 hibernate DEBUG/TRACE 를 켜 두었다.
+#   요청 하나당 로그가 20줄 넘게 찍히는데 System.out 은 동기화된 스트림이라,
+#   수천 개 스레드가 로그를 쓰려고 줄을 선다. 그 대기가 응답시간의 대부분을 차지해
+#   측정값이 "쿠폰 발급 성능" 이 아니라 "로그 출력 성능" 이 되어 버린다.
+#
+#   실측(2026-08-13, 로그 켠 상태): 응답 평균 21.41초, 150,000건 중 93.7% 유실.
+#   자세한 분석은 docs/load-test-k6.md 참고.
+#
+#
+# 왜 Spring 프로파일(application-loadtest.yaml) 이 아니라 환경변수인가
+#
+#   프로파일 파일은 src/main/resources 에 있어 이미지에 구워진다. 즉 파일을 고칠 때마다
+#   이미지를 다시 빌드해야 하고, 빌드를 잊으면 SPRING_PROFILES_ACTIVE 는 활성인데
+#   정작 설정은 안 먹은 상태가 된다 — 로그는 계속 찍히는데 "프로파일 켜짐" 으로 보이는,
+#   조용히 틀린 측정을 하는 가장 나쁜 실패 모드다.
+#
+#   환경변수는 컨테이너에 바로 반영되고 docker inspect 로 실제 적용 여부를 확인할 수 있어
+#   그 함정이 없다. Spring Boot 의 relaxed binding 이 대문자·언더스코어를
+#   logging.level.org.hibernate.SQL 같은 프로퍼티로 알아서 매핑해 준다.
+services:
+  coupon-service:
+    environment:
+      SPRING_JPA_SHOW_SQL: "false"
+      LOGGING_LEVEL_ORG_HIBERNATE_SQL: WARN
+      LOGGING_LEVEL_ORG_HIBERNATE_ORM_JDBC_BIND: WARN
+      LOGGING_LEVEL_COM_EXAMPLE_COUPON: INFO

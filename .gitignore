@@ -1,0 +1,55 @@
+### Gradle / 빌드 산출물 ###
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### 이 프로젝트 ###
+# build-and-run 이 쓰는 로컬 상태 (COUPON_IMAGE_TAG). 빌드 산출물 성격이라 커밋하지 않는다.
+.env
+# jib 이미지 tar(build/jib-*.tar)와 k6 요약 JSON(build/k6/*.json)은 위의 build/ 에서 이미 걸린다.
+HELP.md
+
+### IntelliJ IDEA ###
+.idea/
+.idea_modules/
+*.iml
+*.ipr
+*.iws
+
+### Kotlin ###
+.kotlin
+
+### VS Code ###
+.vscode/
+
+### macOS ###
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+### Windows ###
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
