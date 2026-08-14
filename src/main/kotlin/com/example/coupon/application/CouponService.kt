@@ -4,6 +4,7 @@ import com.example.coupon.api.dto.CreateCouponRequest
 import com.example.coupon.domain.Coupon
 import com.example.coupon.domain.CouponRepository
 import com.example.coupon.domain.Issuance
+import com.example.coupon.infrastructure.messaging.IssuanceRequestProducer
 import com.example.coupon.infrastructure.messaging.IssuanceRequested
 import com.example.coupon.support.CouponNotFoundException
 import com.example.coupon.support.NotStartedException
@@ -17,7 +18,7 @@ import java.time.LocalDateTime
 class CouponService(
     private val couponRepository: CouponRepository,
     private val couponIssuer: CouponIssuer,
-    private val eventPublisher: ApplicationEventPublisher
+    private val issuanceRequestProducer: IssuanceRequestProducer
 ) {
     @Transactional
     fun createCoupon(request: CreateCouponRequest): Coupon {
@@ -35,8 +36,8 @@ class CouponService(
 
     @Transactional
     fun issue(couponId: Long, userId: Long): Issuance {
-       val coupon = couponRepository.findById(couponId)
-           .orElseThrow { CouponNotFoundException() }
+        val coupon = couponRepository.findById(couponId)
+            .orElseThrow { CouponNotFoundException() }
 
         val now = LocalDateTime.now()
         if (!coupon.isBookingOpen(now)) {
@@ -46,7 +47,7 @@ class CouponService(
         couponIssuer.tryIssue(couponId, userId)
 
         val expiresAt = now.plusDays(coupon.validityDays.toLong())
-        eventPublisher.publishEvent(
+        issuanceRequestProducer.publish(
             IssuanceRequested(
                 couponId = couponId,
                 userId = userId,
