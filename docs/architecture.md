@@ -3,11 +3,13 @@
 이 저장소가 어떻게 조립되어 있는지 한 번에 파악하기 위한 문서.
 코드를 처음부터 읽지 않아도 어디에 무엇이 있고 왜 그렇게 되어 있는지 알 수 있게 하는 것이 목적이다.
 
-측정 결과와 그 해석은 [`load-test-k6.md`](load-test-k6.md), 도메인 정의는
-[`domain-model.md`](domain-model.md), 테이블 정의는 [`db-schema.md`](db-schema.md) 에 있다.
+측정 결과와 그 해석은 트랙별로 세 파일에 있다 — 정확성 [`load-test-k6.md`](load-test-k6.md) §1–§12,
+응답시간 [`load-test-response.md`](load-test-response.md) §13–§17,
+효율 [`load-test-efficiency.md`](load-test-efficiency.md) §18–§22 (절 번호는 세 파일에 걸쳐 이어진다).
+도메인 정의는 [`domain-model.md`](domain-model.md), 테이블 정의는 [`db-schema.md`](db-schema.md).
 여기서는 그 숫자들을 다시 적지 않고 가리키기만 한다.
 
-기준 시점: 2026-08-15, `coupon-service:kafka` 측정 직후 (`kafka-restore` 수정 반영).
+기준 시점: 2026-08-17, `coupon-service:l1cache` 측정 직후 (매진 fast path + 보상 제거 반영).
 
 ---
 
@@ -47,13 +49,17 @@
 
 ```
 CouponController.issue
-  └─ CouponService.issue                    @Transactional
-       ├─ couponRepository.findById          SELECT coupon (없으면 COUPON_NOT_FOUND)
-       ├─ coupon.isBookingOpen(now)          시작 전이면 NOT_STARTED
+  └─ CouponService.issue                    트랜잭션 없음 (4-4 에서 뗐다 — 아래 설명)
+       ├─ soldOutState.isSoldOut             Caffeine L1 → 매진이면 여기서 끝 (SOLD_OUT)
+       │                                       미스일 때만 Redis EXISTS
+       ├─ couponIssuePolicyReader.get        캐시 read-through + single-flight + SWR
+       │                                       (미스면 SELECT coupon, 없으면 COUPON_NOT_FOUND)
+       ├─ policy.isBookingOpen(now)          시작 전이면 NOT_STARTED
        ├─ couponIssuer.tryIssue              Redis Lua — 발급 자격 판정이 여기서 원자적으로 끝난다
        │                                       SOLD_OUT / ALREADY_ISSUED 는 여기서 예외로 끝
+       │                                       마지막 한 장이면 sold_out 플래그도 여기서 선다
        └─ issuanceRequestProducer.publish    Kafka 에 던지고 곧바로 200 을 반환한다
-            └─ whenComplete { 실패하면 → couponIssuer.restore }   재고를 되돌린다
+            └─ whenComplete { 실패하면 → ERROR 로그 }   되돌리지는 않는다 (§4)
 
   ⤷ IssuanceWorker — @KafkaListener(concurrency=3), 컨슈머 3개가 파티션 하나씩
        └─ IssuanceWriter.write                UNIQUE 위반은 멱등 처리로 삼키고 넘어간다
@@ -64,29 +70,36 @@ CouponController.issue
 **워커에는 `coupon` 행을 건드리는 쿼리가 없다.** 예전에는 여기서 `incrementIssueQuantity` 를
 같이 쳤는데, 그 값은 `IssuedQuantitySynchronizer` 가 매초 덮어써서 결과에 기여하지 않으면서
 컨슈머들을 단일 행 락에 줄 세우기만 했다. 빼자 부하 종료 후 드레인이 통째로 사라졌다
-([`load-test-k6.md` §16](load-test-k6.md)).
+([`load-test-response.md` §16](load-test-response.md)).
 
 **판정은 Redis, 기록은 큐 뒤의 워커** 로 나뉘어 있는 것이 이 구조의 핵심이다.
 경합이 몰리는 자리(재고 차감, 1인 1매)는 전부 Redis 의 Lua 스크립트 안에 있고,
 DB 쓰기는 응답 경로에서 빠져 있다. 그래서 사용자 응답 p99 가 705ms → 5.95ms 가 됐다
-([`load-test-k6.md` §14.2](load-test-k6.md)).
+([`load-test-response.md` §14.2](load-test-response.md)).
 
 **큐는 이제 JVM 밖에 있다.** Kafka 토픽 `issuance.requested` (파티션 3, 키는 `userId`).
 힙 큐 시절의 용량 상한(10,000)과 `TaskRejectedException`(500)은 없어졌다 — 브로커 디스크가
 받아 주고, 프로세스가 죽어도 메시지가 남는다. 대신 **파티션 3개가 소비 병렬도의 상한**이고
 (`KafkaTopicConfig`), 새 실패 모드가 하나 생겼다 — `publish` 가 실패하면 Redis 재고는
-이미 깎인 뒤다. 그래서 `whenComplete` 에서 `restore` 로 되돌린다 (§4).
+이미 깎인 뒤다. 3-3 에서는 `whenComplete` 에서 되돌렸는데, **4-4 에서 그 보상을 걷어냈다.**
+지금은 ERROR 로그만 남고 그 한 장은 사라진다 (§4).
+
+**`issue` 에는 트랜잭션이 없다.** 4-4 에서 뗐다 — 이 메서드는 DB 쓰기가 없고(워커가 한다)
+읽기도 캐시 로더 안의 `findById` 하나뿐인데 그건 Spring Data 가 자기 트랜잭션을 연다.
+**바깥 트랜잭션은 아무것도 안 지키면서 요청마다 커넥션을 잡고 있었고**, 매진 요청 기준으로
+그게 응답시간의 36%(500µs)였다 ([`load-test-efficiency.md` §22.5](load-test-efficiency.md)).
+`createCoupon` 은 `save` + `initStock` 이라 여전히 `@Transactional` 이다.
 
 **중요한 것은 200 OK 가 "발급 완료" 가 아니라 "접수 완료" 라는 점이다.** 응답 본문의
 `id` 는 아직 저장 전이라 `null` 이고, 실제 행은 워커가 나중에 쓴다. 5,000건을 다 쓰는 데
 **얼마나 뒤에 앉는지는 지금 못 잰다.** `kafka-nocount` 부터는 5,000행이 부하 구간 안에서
 다 들어가서, 부하 종료 후 드레인 폴링에 아무것도 안 잡힌다. "≥160/s" 이상은 말할 수 없다
-([`load-test-k6.md` §16.2](load-test-k6.md)).
+([`load-test-response.md` §16.2](load-test-response.md)).
 
 `coupon.issued_quantity` 는 **`IssuedQuantitySynchronizer` 만 쓴다.**
 1초마다 `total_quantity − (Redis 재고)` 로 덮어쓴다. 즉 이 열은 "Redis 가 센 발급 수" 이고,
 그래서 검증의 `count_match` 가 **Redis 와 DB 의 교차 검증**으로 되살아났다
-([`load-test-k6.md` §16.5](load-test-k6.md)).
+([`load-test-response.md` §16.5](load-test-response.md)).
 
 예외는 전부 `support/DomainException.kt` 의 sealed 계층이고,
 `support/GlobalExceptionHandler.kt` 가 RFC 9457 ProblemDetail 로 변환한다.
@@ -115,10 +128,11 @@ src/main/kotlin/com/example/coupon/
                                   재고는 일부러 안 넣는다 — 캐싱하는 순간 과발급이 돌아온다
     CacheMetrics.kt             카운터 4종 (couponDbReads / couponCacheHits /
                                   soldOutRedisExists / soldOutFastPathHits).
-                                  뒤의 둘은 아직 올리는 코드가 없다 — 매진 즉시 차단 단계에서 붙는다.
-                                  0 으로 나오는 것이 정상이고 결함이 아니다
-    IssuanceCompensator.kt      깎인 재고를 되돌리는 정책 한 곳. 발행 실패·소비 실패가 같이 쓴다
-    CouponIssuer.kt             Redis Lua 호출 래퍼. tryIssue / restore / initStock
+                                  앞의 둘은 CouponCacheRepository, 뒤의 둘은 SoldOutState 가 올린다
+    SoldOutState.kt             매진 fast path. Caffeine L1 (TTL coupon.sold-out.fast-path-ttl-ms)
+                                  미스일 때만 Redis 플래그를 본다. 카운터 2종을 여기서 올린다
+    CouponIssuer.kt             발급 자격 판정. Redis 접근은 IssuanceRedisRepository 에 위임한다
+                                  (tryIssue / initStock / remainingStock)
     IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
     IssuanceService.kt          사용/조회
   infrastructure/messaging/
@@ -131,7 +145,8 @@ src/main/kotlin/com/example/coupon/
     KafkaConfig.kt              프로듀서/컨슈머 팩토리. Jackson 3 직렬화, max.block.ms 3초
     KafkaTopicConfig.kt         토픽 선언 (파티션 3 = 소비 병렬도의 상한).
                                   KafkaConfig 가 KafkaAdmin 을 만들어야 동작한다 — §7 함정 참고
-    KafkaErrorHandlerConfig.kt  재시도 1초 x 3회 → <topic>.DLT, 그리고 재고 복구
+    KafkaErrorHandlerConfig.kt  재시도 1초 x 3회 → <topic>.DLT.
+                                  재고는 되돌리지 않는다 (4-4 에서 보상 제거 — §4)
   domain/
     Coupon.kt                   재고 총량 + 발급 카운터
     Issuance.kt                 발급 1건
@@ -139,6 +154,9 @@ src/main/kotlin/com/example/coupon/
     CouponRepository.kt         비관적 락 버전이 주석으로 보존되어 있다
     IssuanceRepository.kt
   infrastructure/cache/
+    IssuanceRedisRepository.kt  발급 Lua 호출과 재고 키를 쥐고 있는 곳 (issue.lua)
+    SoldOutRedisRepository.kt   sold_out 플래그 존재 확인 (L1 미스일 때만 불린다)
+    SoldOutProperties.kt        coupon.sold-out.* (ttl-seconds, fast-path-ttl-ms)
     CouponCacheRepository.kt    Redis read-through + single-flight + SWR.
                                   카운터를 올리는 유일한 곳.
                                   stale 이면 값을 먼저 돌려주고 갱신은 데몬 스레드 4개로 넘긴다
@@ -149,8 +167,8 @@ src/main/kotlin/com/example/coupon/
     GlobalExceptionHandler.kt   ProblemDetail 변환
 src/main/resources/
   application.yaml              개발 기본값 (쿼리 로그 켜짐) + Hikari 풀 크기 50
-  lua/issue.lua                 Redis 원자 재고 차감
-  lua/restore.lua               그 짝. 되돌리기 (SREM 성공 시에만 INCR — 멱등)
+  lua/issue.lua                 Redis 원자 재고 차감 + 마지막 한 장이면 sold_out 플래그 SET
+                                  (되돌리는 restore.lua 는 4-4 에서 제거됐다 — §4)
   lua/cache-single-flight.lua       캐시 조회 + 락 획득을 한 번에 (HIT | LOAD | WAIT)
                                       — 4.2 까지 쓰던 것. 값이 String 이다
   lua/cache-single-flight-swr.lua   현재. 값이 Hash(value + fetchedAtMs) 이고
@@ -161,13 +179,13 @@ src/main/resources/
 > **Lua 파일명은 코드의 `ClassPathResource` 문자열과 정확히 같아야 한다.**
 > `RedisScript.of(...)` 는 리소스를 지연 로딩하므로 이름이 틀려도 **앱은 정상 기동하고**
 > 매 요청에서만 터진다 — 실제로 한 글자 오타로 전 요청이 500 이 됐다
-> ([`load-test-k6.md` §20.1](load-test-k6.md)).
+> ([`load-test-efficiency.md` §20.1](load-test-efficiency.md)).
 
 > **KEYS/ARGV 개수도 같은 종류의 함정이다.** 계약은 스크립트 헤더 주석에만 있고
 > `runForStrings(script, keys, vararg args)` 는 개수를 세지 않는다. 인자 하나를 빠뜨리면
 > 컴파일도 되고 기동도 되고, Redis 안에서 `ERR Lua redis lib command arguments must be
 > strings or integers` 로 매 요청 터진다 — SWR 을 붙일 때 `lockToken` 을 빠뜨려 그렇게 됐다
-> ([`load-test-k6.md` §21.1](load-test-k6.md)). **Lua 를 고칠 때는 헤더 주석과 호출부를
+> ([`load-test-efficiency.md` §21.1](load-test-efficiency.md)). **Lua 를 고칠 때는 헤더 주석과 호출부를
 > 나란히 놓고 센다.**
 
 ---
@@ -200,7 +218,8 @@ src/main/resources/
 | 키 | 타입 | 누가 만드나 |
 |---|---|---|
 | `coupon:{id}:stock` | String (정수) | `CouponIssuer.initStock` — 쿠폰 생성 시 `total_quantity` 로 초기화 |
-| `coupon:{id}:users` | Set (userId) | `issue.lua` 가 발급 성공 시 `SADD`, `restore.lua` 가 `SREM` |
+| `coupon:{id}:users` | Set (userId) | `issue.lua` 가 발급 성공 시 `SADD` |
+| `coupon:{id}:sold_out` | String (`'1'`) | `issue.lua` 가 **마지막 한 장이 나갈 때** `SET`. TTL `coupon.sold-out.ttl-seconds` |
 | `coupon:{id}:issue-policy` | Hash (`value`, `fetchedAtMs`) | `CouponCacheRepository.fillCache`. TTL `coupon.cache.ttl-ms` |
 | `coupon:{id}:issue-policy:lock` | String (토큰) | 같은 곳. 로더를 하나만 통과시키는 락, TTL 3초 |
 
@@ -208,7 +227,7 @@ src/main/resources/
 stale 판정이 되기 때문**이다(SWR). TTL 만으로는 "만료됐다" 밖에 알 수 없고,
 "아직 살아 있지만 오래됐다" 는 상태를 만들 수 없다. 그 상태가 있어야 **값을 먼저 내주고
 뒤에서 갱신**할 수 있다 — 대기자가 사라지는 것이 거기서 온다
-([`load-test-k6.md` §21](load-test-k6.md)).
+([`load-test-efficiency.md` §21](load-test-efficiency.md)).
 
 **재고의 진실은 DB 가 아니라 Redis 에 있다.** `resources/lua/issue.lua` 한 스크립트가
 중복 여부와 재고를 함께 판정하고 그 자리에서 차감한다.
@@ -220,24 +239,37 @@ Lua 스크립트는 이 여러 명령을 **Redis 서버 안에서 한 덩어리�
 **Lua 를 쓰는 이유는 속도가 아니라 이 원자성이다.**
 
 Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저절로 돌아오지 않는다.
-보상이 없으면 그 한 장은 아무에게도 가지 않은 채 사라지고, 그 사용자는 `:users` 집합에 남아
+되돌리지 않으면 그 한 장은 아무에게도 가지 않은 채 사라지고, 그 사용자는 `:users` 집합에 남아
 다시 시도해도 영영 거절된다. 실제로 `lua` 태그에서 1,000명 시나리오 한 번에 23장이 샜고,
 **DB 만 보는 검증은 그것을 OK 로 통과시켰다** ([`load-test-k6.md` §12.2](load-test-k6.md)).
 `scripts/response/windows/verify-burst.ps1` 이 매번 Redis 잔여 재고를 같이 출력하는 이유다.
 
-**지금 보상은 발행 실패 경로에만 있다** (`kafka-restore`, [§14.7·§15](load-test-k6.md)).
-`CouponService.issue` 가 `publish` 의 future 를 받아 실패하면 `restore.lua` 로 되돌린다.
-`restore.lua` 는 `SREM` 이 실제로 지웠을 때만 `INCR` 하므로 두 번 불려도 안전하다.
-(`kafka` 태그까지는 이 경로가 없었고, `CouponIssuer.restore` 는 `:issued` 라는
-존재하지 않는 키를 지우고 있어 불러도 반쪽만 돌아갔다.)
+### 보상(restore)은 4-4 에서 걷어냈다 — 되돌리지 않는 쪽을 골랐다
 
-**소비 실패에도 보상이 붙었다** (`kafka-dlt-restore`, [§17](load-test-k6.md)).
-워커가 3회 재시도 끝에 DLT 로 보낼 때 같이 되돌린다. 순서는 **DLT 발행 → 복구** 다.
-정책은 `application/IssuanceCompensator` 한 곳에 있고 두 경로가 같이 쓴다.
+3-3 에서 붙였던 두 보상 경로(`kafka-restore` §15 / `kafka-dlt-restore` §17)는
+**매진 fast path 를 붙이면서 무력해졌고, 그래서 제거했다.**
 
-**아직 안 막힌 자리 둘.** 역직렬화가 실패하면 `couponId` 를 알 수 없어 되돌리지 못한다
-(ERROR 로그만 남는다). 그리고 ack 이 애매하게 실패하면 보상이 과잉이 되어 총량을 넘길 수 있다
-([`load-test-k6.md` §15.3](load-test-k6.md)).
+이유는 상태가 하나 늘었기 때문이다. `issue.lua` 는 마지막 한 장이 나갈 때
+`coupon:{id}:sold_out` 플래그를 세우는데, `restore.lua` 는 재고와 `:users` 만 되돌리고
+**그 플래그는 모른다.**
+
+| | 재고 | `sold_out` 플래그 | 결과 |
+|---|---|---|---|
+| 보상 있음 | 1 로 복구 | 남아 있음 = **거짓** | 복구한 재고를 fast path 가 도로 막는다. TTL(기본 24시간) 동안 전원 차단 |
+| **보상 없음 (현재)** | 0 (깎인 채) | **정확** | 1장 유실(과소발급). 그 사용자는 `:users` 에 남아 거절 |
+
+**보상이 복구한 재고를 자기가 세운 플래그로 도로 막는 구조**여서, 살리려면 `restore.lua` 가
+플래그까지 지워야 했다. 그렇게 하는 대신 **과소발급을 받아들이기로 했다** — 이 트랙에서
+재려는 것은 매진 차단의 비용이고, 보상 경로는 정상 부하에서 한 번도 타지 않기 때문이다.
+
+**그래서 지금 남는 결함은 이것이다.** 발행 실패(`CouponService.issue`)나 소비 실패(DLT)가
+나면 그 한 장은 사라지고 사용자는 영영 거절된다. **DB 안에는 모순이 없어 verify 세 판정은
+전부 OK 로 통과하므로 ERROR 로그가 유일한 흔적이다.** `verify-burst.ps1` 이 찍는
+Redis 잔여 재고가 다시 어긋날 수 있다 — §12.2 와 같은 자리로 돌아온 것이고, 의도된 것이다.
+
+되살릴 때 필요한 것: `restore.lua` 복원 + `KEYS[3] = sold_out` 을 받아 `INCR` 자리에서 `DEL`,
+그리고 `IssuanceCompensator` 를 다시 두어 두 경로가 같은 정책을 쓰게 한다.
+(옛 구현은 git 이력에 있다 — `kafka-dlt-restore` 시점.)
 
 ---
 
@@ -259,9 +291,13 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저
 | `kafka` | 위와 같음 | **Kafka (파티션 3, 컨슈머 3)** | OK (발행 실패 시 유실) | 응답 5,000/s · 쓰기 ~157/틱 |
 | `kafka-restore` | 위와 같음 | 위와 같음 + **발행 실패 시 재고 보상** | OK | 응답 5,000/s · 쓰기 ~160/틱 |
 | `kafka-nocount` | 위와 같음 | 위와 같음, 단 **워커에서 카운터 UPDATE 제거** | OK | 응답 5,000/s · 쓰기 ≥160/s (상한 미상) |
-| **`kafka-dlt-restore` (현재)** | 위와 같음 | 위와 같음 + **소비 실패(DLT)에도 재고 보상** | OK | 위와 같음 |
+| `kafka-dlt-restore` | 위와 같음 | 위와 같음 + **소비 실패(DLT)에도 재고 보상** | OK | 위와 같음 |
 
 `pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있다.
+
+**이 축은 `kafka-dlt-restore` 에서 멈췄다.** 이후 태그(`cache-4-0` ~ )는 아래 효율 단계이고
+재고 판정·쓰기 경로를 건드리지 않는다. 단 하나 예외가 **4-4 에서 두 보상을 제거한 것**이고,
+그래서 `kafka-restore`·`kafka-dlt-restore` 행이 설명하는 기능은 **현재 코드에 없다**(§4).
 
 ### 효율 단계 — 바꾸는 축이 다르다
 
@@ -289,10 +325,19 @@ p99 가 아니라 카운터로 한다.
 대신 `couponDbReads` 가 27 → 49 로 **늘었다** — 회귀가 아니라 갱신 주기를 TTL(1000ms)이 아니라
 `fresh-ms`(500ms)가 잡게 됐기 때문이고, 값을 되돌리는 노브가 있다. **`ttl - fresh` 는
 로더가 늦어도 되는 예산이고, 0 으로 만들면 4.2 의 대기가 돌아온다.**
-자세히는 [`load-test-k6.md` §18–21](load-test-k6.md).
+자세히는 [`load-test-efficiency.md` §18–§21](load-test-efficiency.md).
 
-**두 번째 시나리오(`sellout`)는 아직 4-0 조건에서만 쟀다** ([§18.2](load-test-k6.md)).
-매진 즉시 차단(Caffeine L1)에 들어가기 전에 현재 조건의 기준선을 다시 잡아야 한다.
+**두 번째 시나리오(`sellout`, 4,000/s × 30s ≈ 120,000)는 따로 잰다.** 위 표와 가로로 비교하면 안 된다.
+
+| 태그 | `couponDbReads` | Redis 명령 | p(50) | `soldOutFastPathHits` |
+|---|---:|---:|---:|---:|
+| `swr-4.3` | 49 | 요청당 2회 ≈ 8,300/s | 1.40ms | 0 |
+| **`l1cache` (현재)** | **0** | **1/s** (30초에 30번) | **334µs** | **요청 수와 일치** |
+
+**매진 요청의 99.975% 가 프로세스 안에서 끝난다.** 그리고 med 1.40ms → 334µs 중
+**500µs 는 `@Transactional` 을 뗀 몫**이다 — DB 를 한 줄도 안 읽는 요청이 트랜잭션을 열고
+있었고, 캐시 작업을 다 끝낸 뒤에야 그게 전체의 36% 로 드러났다
+([`load-test-efficiency.md` §22](load-test-efficiency.md)).
 
 **이 표에서 읽어야 할 것 둘.**
 
@@ -320,7 +365,8 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 큐가 한 일은 그것을 **사용자 응답 밖으로** 옮긴 것까지다.
 
 자세한 분석은 [`load-test-k6.md` §12](load-test-k6.md)(동기 구현들),
-[§13](load-test-k6.md)(큐 디커플링), [§14–16](load-test-k6.md)(Kafka·병목 확정).
+[`load-test-response.md` §13](load-test-response.md)(큐 디커플링),
+[§14–§16](load-test-response.md)(Kafka·병목 확정).
 
 ---
 
@@ -374,7 +420,7 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
   대신 `sell-out.ps1` 이 재고 카운터가 0 이 되는 것을 폴링해 사전 조건을 보장한다
 - **`status 0` 을 지연 분포에서 제외.** 연결 거부는 `duration ≈ 0ms` 로 기록돼 p99 를
   실제보다 좋게 만든다. `status_conn_error` 로 따로 세고 같이 읽는다
-  ([`load-test-k6.md` §13.2](load-test-k6.md)).
+  ([`load-test-response.md` §13.2](load-test-response.md)).
   **efficiency 트랙도 같은 처리를 한다** — 특히 매진 시그널의 fast-path 효과를 볼 때
   이걸 안 빼면 "빨라진 것" 과 "튕긴 것" 이 구분되지 않는다
 
@@ -492,7 +538,7 @@ Kafka 는 반대다. **메시지가 남는다.** 그래서 이제 위험은 유�
 500ms 를 넘길 수 없으므로 종료 코드 쪽이 틀린 것이다 (원인 미확정). 판정은 요약 JSON 의
 `metrics.issue_latency.thresholds` 로 한다 (`true` = 넘김, `false` = 통과).
 `response/windows/run.ps1` 이 그것을 읽어 출력하고 종료 코드와 어긋나면 알려준다
-→ [`load-test-k6.md` §13.2](load-test-k6.md)
+→ [`load-test-response.md` §13.2](load-test-response.md)
 
 **이 프로젝트에는 Kafka 자동설정이 없다. `application.yaml` 의 `spring.kafka.*` 는 거의 다 무시된다.**
 `build.gradle.kts` 가 `spring-boot-starter-kafka` 가 아니라 `org.springframework.kafka:spring-kafka` 를
@@ -505,11 +551,11 @@ DLT 는 아예 없었다), `KafkaConfig` 에 `KafkaAdmin` 빈을 직접 만들�
 
 **PowerShell 에서 컨테이너 로그를 한글로 검색하면 안 잡힌다.** `docker compose logs` 의
 UTF-8 출력을 콘솔이 CP949 로 읽어 `諛쒓툒 湲곕줉...` 처럼 깨지므로,
-`Select-String '재고 보상'` 이 **빈 결과**를 낸다. 로그가 없는 것이 아니라 화면이 깨진 것인데,
-**정상 동작을 실패로 읽게 되는 자리다** (실제로 한 번 그럴 뻔했다).
+`Select-String '재고가 깎인 채로'` 가 **빈 결과**를 낸다. 로그가 없는 것이 아니라 화면이 깨진 것인데,
+**정상 동작을 실패로 읽게 되는 자리다** (실제로 한 번 그럴 뻔했다 — 그때는 `재고 보상` 이었다).
 
 ```powershell
-docker compose logs coupon-service | Select-String 'IssuanceCompensator'   # ASCII 로 찾는다
+docker compose logs coupon-service | Select-String 'CouponService|KafkaErrorHandler'   # ASCII 로 찾는다
 [Console]::OutputEncoding=[Text.Encoding]::UTF8                            # 또는 인코딩을 맞춘다 (그 세션 한정)
 ```
 
@@ -557,7 +603,8 @@ Docker 가 **빈 디렉터리를 만들어 주기 때문에** 에러가 아니�
 행 락을 없애자 커넥션 수가, 커넥션을 늘리자 그 다음이 드러났고,
 쓰기를 큐 뒤로 밀자 응답 경로에서는 아예 사라졌다.
 그리고 그 큐 뒤에 다시 나타난 것도 **같은 단일 행 UPDATE** 였다.
-근거와 계산은 [`load-test-k6.md` §12.4, §12.7, §13, §14, §16](load-test-k6.md).
+근거와 계산은 [`load-test-k6.md` §12.4, §12.7](load-test-k6.md) 과
+[`load-test-response.md` §13, §14, §16](load-test-response.md).
 
 **`queue-mem` 에서 부하가 처음으로 100% 전달됐다.** `dropped_iterations` 0,
 `vus_max` 가 상한(5,000)에 붙지 않음, `status 0` 0건. 그래서 §9 의 신뢰 조건을 여유 있게
@@ -565,13 +612,13 @@ Docker 가 **빈 디렉터리를 만들어 주기 때문에** 에러가 아니�
 
 **쓰기 병목 질문은 닫혔다.** 소비자 수가 아니고(`kafka`, 3배로 늘려도 155 → 157),
 커밋당 fsync 도 아니다 — `coupon` 단일 행 UPDATE 한 줄을 빼자 드레인이 통째로 사라졌다
-(`kafka-nocount`, [`load-test-k6.md` §16.4](load-test-k6.md)).
+(`kafka-nocount`, [`load-test-response.md` §16.4](load-test-response.md)).
 
 **쓰기 처리량 비교는 여기서 닫았다.** 하네스(드레인 폴링)는 "부하가 끝난 뒤에도 계속 쓰는"
 구현을 재려고 만든 것인데 `kafka-nocount` 는 부하 구간 안에서 다 끝내므로 표본이 안 잡힌다.
 **"≥160/s, 상한 미상" 이 닫는 시점의 상태이고, 이건 결함이 아니라 자의 눈금이 여기까지라는 뜻이다.**
 다시 열 일이 생기면 `written_at` 계측 컬럼을 하네스가 추가하는 방식으로 간다
-([`load-test-k6.md` §16.6](load-test-k6.md)).
+([`load-test-response.md` §16.6](load-test-response.md)).
 
 지금 답이 없는 질문 둘.
 - **응답 p99 가 6.45 → 11.74ms 로 밀린 이유를 아직 안 갈랐다.** 쓰기가 부하 구간 안으로

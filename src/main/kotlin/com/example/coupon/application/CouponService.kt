@@ -10,10 +10,13 @@ import com.example.coupon.infrastructure.messaging.IssuanceRequested
 import com.example.coupon.support.CouponNotFoundException
 import com.example.coupon.support.IssuanceAcceptFailedException
 import com.example.coupon.support.NotStartedException
+import com.example.coupon.support.SoldOutException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.LocalDateTime
+
+private val log = KotlinLogging.logger {}
 
 @Service
 class CouponService(
@@ -21,7 +24,7 @@ class CouponService(
     private val couponIssuePolicyReader: CouponIssuePolicyReader,
     private val couponIssuer: CouponIssuer,
     private val issuanceRequestProducer: IssuanceRequestProducer,
-    private val issuanceCompensator: IssuanceCompensator,
+    private val soldOutState: SoldOutState,
 ) {
     @Transactional
     fun createCoupon(request: CreateCouponRequest): Coupon {
@@ -37,8 +40,11 @@ class CouponService(
         return coupon
     }
 
-    @Transactional
     fun issue(couponId: Long, userId: Long): Issuance {
+        if (soldOutState.isSoldOut(couponId)) {
+            throw SoldOutException()
+        }
+
         val policy = couponIssuePolicyReader.get(couponId)
 
         val now = LocalDateTime.now()
@@ -56,22 +62,24 @@ class CouponService(
             expiresAt = expiresAt,
         )
 
-        // 여기서부터가 보상 구간이다. tryIssue 가 Redis 재고를 이미 깎았으므로,
-        // 큐에 넣지 못하면 그 한 장은 아무에게도 가지 않은 채 사라진다(과소발급).
-        // DB 안에는 모순이 없어 verify 의 세 판정은 전부 OK 로 통과한다 — 12.2 와 같은 실패 모드다.
+        // 발행에 실패하면 그 한 장은 아무에게도 가지 않은 채 사라진다(과소발급).
+        // 4-4 에서 보상(restore)을 걷어냈으므로 되돌리지 않는다 — 재고는 깎인 채로 남고
+        // 그 사용자는 :users 에 남아 다시 시도해도 거절된다. 의도된 선택이고,
+        // 그 대신 매진 플래그가 실제 재고와 어긋나지 않는다 (docs/architecture.md 4).
+        // DB 안에는 모순이 없어 verify 의 세 판정은 전부 OK 로 통과하므로 로그가 유일한 흔적이다.
         try {
             issuanceRequestProducer.publish(event)
-                // 콜백은 프로듀서 I/O 스레드에서 돈다. 요청 스레드를 잡지 않고,
-                // Redis 만 건드리므로 이 트랜잭션이 끝난 뒤에 실행돼도 상관없다.
+                // 콜백은 프로듀서 I/O 스레드에서 돈다. 요청 스레드를 잡지 않는다.
                 .whenComplete { _, error ->
-                    if (error != null) issuanceCompensator.compensate(couponId, userId, error, PHASE)
+                    if (error != null) log.error(error) {
+                        "$PHASE 실패 — 재고가 깎인 채로 남는다: couponId=$couponId, userId=$userId"
+                    }
                 }
         }
         catch (e: Exception) {
             // send 가 즉시 던지는 경우 (직렬화 실패, 메타데이터 대기 초과 = max.block.ms).
-            // 되돌렸으므로 이 사용자는 지금 다시 시도하면 성공한다. 그래서 500 이 아니라 503 이다.
-            // 원인 예외는 compensate 안에서 ERROR 로그로 남으므로 여기서 흘려보내도 잃지 않는다.
-            issuanceCompensator.compensate(couponId, userId, e, PHASE)
+            // 재시도해도 이 사용자는 :users 에 남아 있어 거절된다 — 그럼에도 서버 쪽 사정이므로 503 이다.
+            log.error(e) { "$PHASE 실패 — 재고가 깎인 채로 남는다: couponId=$couponId, userId=$userId" }
             throw IssuanceAcceptFailedException()
         }
 
