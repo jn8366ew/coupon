@@ -114,7 +114,9 @@ src/main/kotlin/com/example/coupon/
     CouponIssuePolicy.kt        캐싱되는 값 (startsAt, validityDays).
                                   재고는 일부러 안 넣는다 — 캐싱하는 순간 과발급이 돌아온다
     CacheMetrics.kt             카운터 4종 (couponDbReads / couponCacheHits /
-                                  soldOutRedisExists / soldOutFastPathHits)
+                                  soldOutRedisExists / soldOutFastPathHits).
+                                  뒤의 둘은 아직 올리는 코드가 없다 — 매진 즉시 차단 단계에서 붙는다.
+                                  0 으로 나오는 것이 정상이고 결함이 아니다
     IssuanceCompensator.kt      깎인 재고를 되돌리는 정책 한 곳. 발행 실패·소비 실패가 같이 쓴다
     CouponIssuer.kt             Redis Lua 호출 래퍼. tryIssue / restore / initStock
     IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
@@ -137,8 +139,10 @@ src/main/kotlin/com/example/coupon/
     CouponRepository.kt         비관적 락 버전이 주석으로 보존되어 있다
     IssuanceRepository.kt
   infrastructure/cache/
-    CouponCacheRepository.kt    Redis read-through + single-flight. 카운터를 올리는 유일한 곳
-    CacheProperties.kt          coupon.cache.* (ttl-ms, simulated-load-latency-ms)
+    CouponCacheRepository.kt    Redis read-through + single-flight + SWR.
+                                  카운터를 올리는 유일한 곳.
+                                  stale 이면 값을 먼저 돌려주고 갱신은 데몬 스레드 4개로 넘긴다
+    CacheProperties.kt          coupon.cache.* (ttl-ms, fresh-ms, simulated-load-latency-ms)
     RedisSupport.kt             Lua 로딩·실행 헬퍼. KEYS 는 키만, 값은 ARGV 로
   support/
     DomainException.kt          sealed 예외 + HTTP 상태 + code
@@ -147,14 +151,24 @@ src/main/resources/
   application.yaml              개발 기본값 (쿼리 로그 켜짐) + Hikari 풀 크기 50
   lua/issue.lua                 Redis 원자 재고 차감
   lua/restore.lua               그 짝. 되돌리기 (SREM 성공 시에만 INCR — 멱등)
-  lua/cache-single-flight.lua   캐시 조회 + 락 획득을 한 번에 (HIT | LOAD | WAIT)
-  lua/release-lock.lua          내 토큰이 쥔 락만 해제
+  lua/cache-single-flight.lua       캐시 조회 + 락 획득을 한 번에 (HIT | LOAD | WAIT)
+                                      — 4.2 까지 쓰던 것. 값이 String 이다
+  lua/cache-single-flight-swr.lua   현재. 값이 Hash(value + fetchedAtMs) 이고
+                                      STALE_REFRESH 가 추가됐다 (HIT | STALE_REFRESH | LOAD | WAIT)
+  lua/release-lock.lua              내 토큰이 쥔 락만 해제
 ```
 
 > **Lua 파일명은 코드의 `ClassPathResource` 문자열과 정확히 같아야 한다.**
 > `RedisScript.of(...)` 는 리소스를 지연 로딩하므로 이름이 틀려도 **앱은 정상 기동하고**
 > 매 요청에서만 터진다 — 실제로 한 글자 오타로 전 요청이 500 이 됐다
 > ([`load-test-k6.md` §20.1](load-test-k6.md)).
+
+> **KEYS/ARGV 개수도 같은 종류의 함정이다.** 계약은 스크립트 헤더 주석에만 있고
+> `runForStrings(script, keys, vararg args)` 는 개수를 세지 않는다. 인자 하나를 빠뜨리면
+> 컴파일도 되고 기동도 되고, Redis 안에서 `ERR Lua redis lib command arguments must be
+> strings or integers` 로 매 요청 터진다 — SWR 을 붙일 때 `lockToken` 을 빠뜨려 그렇게 됐다
+> ([`load-test-k6.md` §21.1](load-test-k6.md)). **Lua 를 고칠 때는 헤더 주석과 호출부를
+> 나란히 놓고 센다.**
 
 ---
 
@@ -187,6 +201,14 @@ src/main/resources/
 |---|---|---|
 | `coupon:{id}:stock` | String (정수) | `CouponIssuer.initStock` — 쿠폰 생성 시 `total_quantity` 로 초기화 |
 | `coupon:{id}:users` | Set (userId) | `issue.lua` 가 발급 성공 시 `SADD`, `restore.lua` 가 `SREM` |
+| `coupon:{id}:issue-policy` | Hash (`value`, `fetchedAtMs`) | `CouponCacheRepository.fillCache`. TTL `coupon.cache.ttl-ms` |
+| `coupon:{id}:issue-policy:lock` | String (토큰) | 같은 곳. 로더를 하나만 통과시키는 락, TTL 3초 |
+
+`issue-policy` 가 String 이 아니라 Hash 인 이유는 **값과 함께 `fetchedAtMs` 를 읽어야
+stale 판정이 되기 때문**이다(SWR). TTL 만으로는 "만료됐다" 밖에 알 수 없고,
+"아직 살아 있지만 오래됐다" 는 상태를 만들 수 없다. 그 상태가 있어야 **값을 먼저 내주고
+뒤에서 갱신**할 수 있다 — 대기자가 사라지는 것이 거기서 온다
+([`load-test-k6.md` §21](load-test-k6.md)).
 
 **재고의 진실은 DB 가 아니라 Redis 에 있다.** `resources/lua/issue.lua` 한 스크립트가
 중복 여부와 재고를 함께 판정하고 그 자리에서 차감한다.
@@ -245,13 +267,15 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저
 
 위 표가 **재고 판정과 쓰기 경로**를 바꿔 왔다면, 여기는 **쿠폰 정보 조회 경로**만 바꾼다.
 발급 정확성에는 손대지 않으므로 정확성 트랙 결과도 바뀌지 않는다.
-측정은 효율 트랙(`scripts/efficiency/`)으로 하고, 조건은 TTL 1000ms / 조회 지연 100ms 다.
+측정은 효율 트랙(`scripts/efficiency/`)으로 하고, 조건은 TTL 1000ms / 조회 지연 100ms
+(4.3 부터 fresh 500ms)다. 아래는 전부 `-Scenario policy` 다.
 
 | 태그 | 조회 경로 | `couponDbReads` (요청 15,001) | p(99) |
 |---|---|---:|---:|
 | `cache-4-0` | 매 요청 DB | 15,001 | 747.91ms |
 | `rediscache-4-1` | Redis read-through | 1,250 | 102.37ms |
-| **`single-flight-4.2` (현재)** | 위 + 락으로 로더 1개만 통과 | **27** | 103.11ms |
+| `single-flight-4.2` | 위 + 락으로 로더 1개만 통과 | **27** | 103.11ms |
+| **`swr-4.3` (현재)** | 위 + stale 은 먼저 내주고 뒤에서 갱신 | 49 | **1.66ms** |
 
 **여기서 읽어야 할 것.** `rediscache-4-1` 의 1,250 은 캐시가 덜 먹은 것이 아니라
 **만료 직후 100ms 창에 몰려 들어간 stampede** 다 (25 사이클 × 50건). 락을 걸자 27건,
@@ -259,8 +283,16 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저
 
 **그런데 p(99) 는 102 → 103ms 로 제자리다.** 로더는 하나여도 나머지 49건은 여전히 기다리기
 때문이다. **DB 부하와 사용자 지연은 같이 움직이지 않는다** — 그래서 이 트랙의 판정은
-p99 가 아니라 카운터로 한다. 지연이 사라지는 것은 stale 을 먼저 내주는 SWR 부터다.
-자세히는 [`load-test-k6.md` §18–20](load-test-k6.md).
+p99 가 아니라 카운터로 한다.
+
+**SWR 이 그 나머지 49건을 없앴다.** p(99) 103 → 1.66ms, `vus max` 18 → 2.
+대신 `couponDbReads` 가 27 → 49 로 **늘었다** — 회귀가 아니라 갱신 주기를 TTL(1000ms)이 아니라
+`fresh-ms`(500ms)가 잡게 됐기 때문이고, 값을 되돌리는 노브가 있다. **`ttl - fresh` 는
+로더가 늦어도 되는 예산이고, 0 으로 만들면 4.2 의 대기가 돌아온다.**
+자세히는 [`load-test-k6.md` §18–21](load-test-k6.md).
+
+**두 번째 시나리오(`sellout`)는 아직 4-0 조건에서만 쟀다** ([§18.2](load-test-k6.md)).
+매진 즉시 차단(Caffeine L1)에 들어가기 전에 현재 조건의 기준선을 다시 잡아야 한다.
 
 **이 표에서 읽어야 할 것 둘.**
 

@@ -29,7 +29,11 @@ spring:
 
 coupon:
   cache:
+    # 쿠폰 캐시 TTL. stampede 측정 시 1000 (1초) 으로 오버라이드.
     ttl-ms: ${COUPON_CACHE_TTL_MS:10000}
+    # SWR fresh window, 캐시를 최신으로 보는 시간, ttl-ms보다 짧게. 이 안: 즉시 반환, 넘으면 stale + 백그라운드 갱신.
+    fresh-ms: ${COUPON_CACHE_FRESH_MS:500}
+    # loader latency (DB 조회 지연시간) 시뮬레이션. loader 안에서 Thread.sleep. 0=비활성.
     simulated-load-latency-ms: ${COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS:0}
 
 logging:
