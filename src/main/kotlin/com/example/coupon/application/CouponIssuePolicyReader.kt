@@ -12,10 +12,10 @@ class CouponIssuePolicyReader(
     private val couponCacheRepository: CouponCacheRepository,
     private val cacheProperties: CacheProperties,
 ) {
-    fun get(couponId: Long): CouponPolicy = couponCacheRepository.getIssuePolicyOrLoad(couponId) {
+    fun get(couponId: Long): CouponIssuePolicy = couponCacheRepository.getIssuePolicyOrLoad(couponId) {
         Thread.sleep(cacheProperties.simulatedLoadLatencyMs)
         couponRepository.findById(couponId)
             .orElseThrow { CouponNotFoundException() }
-            .let(CouponPolicy::from)
+            .let(CouponIssuePolicy::from)
     }
 }

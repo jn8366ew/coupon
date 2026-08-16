@@ -63,6 +63,9 @@ export default function () {
         'route exists (not 404)': (r) => r.status !== 404,
         // status 0 = 연결 자체가 실패(거절/타임아웃). 404 검사만으로는 0 을 못 잡는다.
         'connected (not status 0)': (r) => r.status !== 0,
+        // 500 은 위 두 검사를 모두 통과한다. 이 시나리오는 거절(409)이 정상이라
+        // 상태 코드 카운터만으로는 "정상 거절" 과 "서버 오류" 가 잘 안 구분된다.
+        'no server error (not 5xx)': (r) => r.status < 500,
     });
 
     // 왜 status 0 을 지연 분포에서 빼는가

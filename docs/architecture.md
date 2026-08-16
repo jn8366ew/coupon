@@ -106,9 +106,15 @@ src/main/kotlin/com/example/coupon/
     CouponController.kt         쿠폰 생성 / 발급
     IssuanceController.kt       발급분 사용
     UserIssuanceController.kt   내 발급 내역 조회
+    CacheMetricsController.kt   GET/POST /metrics/cache — 효율 트랙의 결과물
     dto/                        요청·응답 DTO (from() 팩토리로 엔티티 변환)
   application/
     CouponService.kt            발급 흐름. 조회 → 게이트 통과 → 발행하고 즉시 반환
+    CouponIssuePolicyReader.kt  쿠폰 정보 조회 진입점. 캐시에 위임하고, 미스일 때 쓸 로더를 넘긴다
+    CouponIssuePolicy.kt        캐싱되는 값 (startsAt, validityDays).
+                                  재고는 일부러 안 넣는다 — 캐싱하는 순간 과발급이 돌아온다
+    CacheMetrics.kt             카운터 4종 (couponDbReads / couponCacheHits /
+                                  soldOutRedisExists / soldOutFastPathHits)
     IssuanceCompensator.kt      깎인 재고를 되돌리는 정책 한 곳. 발행 실패·소비 실패가 같이 쓴다
     CouponIssuer.kt             Redis Lua 호출 래퍼. tryIssue / restore / initStock
     IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
@@ -130,6 +136,10 @@ src/main/kotlin/com/example/coupon/
     IssuanceStatus.kt           ISSUED / USED / EXPIRED
     CouponRepository.kt         비관적 락 버전이 주석으로 보존되어 있다
     IssuanceRepository.kt
+  infrastructure/cache/
+    CouponCacheRepository.kt    Redis read-through + single-flight. 카운터를 올리는 유일한 곳
+    CacheProperties.kt          coupon.cache.* (ttl-ms, simulated-load-latency-ms)
+    RedisSupport.kt             Lua 로딩·실행 헬퍼. KEYS 는 키만, 값은 ARGV 로
   support/
     DomainException.kt          sealed 예외 + HTTP 상태 + code
     GlobalExceptionHandler.kt   ProblemDetail 변환
@@ -137,7 +147,14 @@ src/main/resources/
   application.yaml              개발 기본값 (쿼리 로그 켜짐) + Hikari 풀 크기 50
   lua/issue.lua                 Redis 원자 재고 차감
   lua/restore.lua               그 짝. 되돌리기 (SREM 성공 시에만 INCR — 멱등)
+  lua/cache-single-flight.lua   캐시 조회 + 락 획득을 한 번에 (HIT | LOAD | WAIT)
+  lua/release-lock.lua          내 토큰이 쥔 락만 해제
 ```
+
+> **Lua 파일명은 코드의 `ClassPathResource` 문자열과 정확히 같아야 한다.**
+> `RedisScript.of(...)` 는 리소스를 지연 로딩하므로 이름이 틀려도 **앱은 정상 기동하고**
+> 매 요청에서만 터진다 — 실제로 한 글자 오타로 전 요청이 500 이 됐다
+> ([`load-test-k6.md` §20.1](load-test-k6.md)).
 
 ---
 
@@ -223,6 +240,27 @@ Redis 는 DB 트랜잭션 밖이므로 차감 뒤에 무슨 일이 생겨도 저
 | **`kafka-dlt-restore` (현재)** | 위와 같음 | 위와 같음 + **소비 실패(DLT)에도 재고 보상** | OK | 위와 같음 |
 
 `pessimistic` 버전의 리포지토리 메서드는 `domain/CouponRepository.kt` 에 주석으로 보존되어 있다.
+
+### 효율 단계 — 바꾸는 축이 다르다
+
+위 표가 **재고 판정과 쓰기 경로**를 바꿔 왔다면, 여기는 **쿠폰 정보 조회 경로**만 바꾼다.
+발급 정확성에는 손대지 않으므로 정확성 트랙 결과도 바뀌지 않는다.
+측정은 효율 트랙(`scripts/efficiency/`)으로 하고, 조건은 TTL 1000ms / 조회 지연 100ms 다.
+
+| 태그 | 조회 경로 | `couponDbReads` (요청 15,001) | p(99) |
+|---|---|---:|---:|
+| `cache-4-0` | 매 요청 DB | 15,001 | 747.91ms |
+| `rediscache-4-1` | Redis read-through | 1,250 | 102.37ms |
+| **`single-flight-4.2` (현재)** | 위 + 락으로 로더 1개만 통과 | **27** | 103.11ms |
+
+**여기서 읽어야 할 것.** `rediscache-4-1` 의 1,250 은 캐시가 덜 먹은 것이 아니라
+**만료 직후 100ms 창에 몰려 들어간 stampede** 다 (25 사이클 × 50건). 락을 걸자 27건,
+곧 사이클당 1건이라는 하한에 닿았다.
+
+**그런데 p(99) 는 102 → 103ms 로 제자리다.** 로더는 하나여도 나머지 49건은 여전히 기다리기
+때문이다. **DB 부하와 사용자 지연은 같이 움직이지 않는다** — 그래서 이 트랙의 판정은
+p99 가 아니라 카운터로 한다. 지연이 사라지는 것은 stale 을 먼저 내주는 SWR 부터다.
+자세히는 [`load-test-k6.md` §18–20](load-test-k6.md).
 
 **이 표에서 읽어야 할 것 둘.**
 

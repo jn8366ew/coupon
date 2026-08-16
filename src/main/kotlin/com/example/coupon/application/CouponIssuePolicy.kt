@@ -3,7 +3,7 @@ package com.example.coupon.application
 import com.example.coupon.domain.Coupon
 import java.time.LocalDateTime
 
-class CouponPolicy (
+class CouponIssuePolicy (
     val startsAt: LocalDateTime?,
     val validityDays: Int,
 ) {
@@ -11,7 +11,7 @@ class CouponPolicy (
         startsAt?.let { !now.isBefore(it)} ?: true
 
     companion object {
-        fun from(coupon: Coupon): CouponPolicy = CouponPolicy(
+        fun from(coupon: Coupon): CouponIssuePolicy = CouponIssuePolicy(
             startsAt=coupon.startsAt,
             validityDays = coupon.validityDays,
         )

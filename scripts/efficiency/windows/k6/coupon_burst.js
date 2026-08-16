@@ -57,8 +57,13 @@ export const options = {
     },
     // 기본 요약은 p(90)/p(95) 까지만 낸다. 이 트랙의 관심사가 p99 라 명시적으로 넣는다.
     summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
-    // single-flight 도입 (4-1b) 이후엔 stampede 윈도우 안의 P99 가 여전히 튀므로
-    // threshold 깨지는 게 정상. SWR (4-1c) 에서 통과.
+    // 이 threshold 는 판정 기준이 아니다 — 참고용으로만 본다.
+    // 실측(TTL 1000 / latency 100, docs/load-test-k6.md §18~§20):
+    //   cache-4-0        p(99) 747.91ms  깨짐
+    //   rediscache-4-1   p(99) 102.37ms  통과
+    //   single-flight    p(99) 103.11ms  통과 — DB 조회는 46배 줄었는데 p99 는 제자리다
+    // 즉 200ms 선은 stampede 개선을 구분하지 못한다. 이 시나리오의 판정은 couponDbReads 로 한다.
+    // p99 가 지표가 되는 것은 대기 자체가 사라지는 SWR 부터다.
     // (k6 은 threshold 가 깨지면 exit 99 를 낸다. run.ps1 이 그 코드를 허용한다.)
     thresholds: {
         'issue_policy_latency': ['p(99)<200'],
@@ -77,6 +82,10 @@ export default function () {
         'route exists (not 404)': (r) => r.status !== 404,
         // status 0 = 연결 자체가 실패(거절/타임아웃). 404 검사만으로는 0 을 못 잡는다.
         'connected (not status 0)': (r) => r.status !== 0,
+        // 500 은 위 두 검사를 모두 통과한다. single-flight 도입 때 Lua 파일명이 한 글자
+        // 틀려 전 요청이 500 이었는데 checks 는 100% 로 나왔다. 그때 이 줄이 있었다면
+        // 즉시 66% 로 드러났다.
+        'no server error (not 5xx)': (r) => r.status < 500,
     });
 
     // 왜 status 0 을 지연 분포에서 빼는가

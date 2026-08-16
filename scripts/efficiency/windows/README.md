@@ -21,8 +21,9 @@
 **예전 태그의 이미지에는 `/metrics/cache` 가 없다.** 그 상태로 돌리면 `run.ps1` 이
 측정 시작 전에 멈추고 이 커맨드를 안내한다 (DB/Redis 는 건드리기 전이다).
 
-- 단계별로 태그를 나눈다: `cache-4-0` → `cache-4-1b` → `cache-4-1c` → `cache-4-2`.
-  요약 JSON 이름에 태그가 붙으므로 `coupon_burst-cache-4-0-steady.json` 처럼 남는다.
+- 단계별로 태그를 나눈다. 지금까지: `cache-4-0`(캐시 없음) → `rediscache-4-1`(Redis read-through)
+  → `single-flight-4.2`(락으로 stampede 차단) → SWR → L1 캐시(시나리오 ②).
+  요약 JSON 이름에 태그가 붙으므로 `coupon_burst-single-flight-4.2-steady.json` 처럼 남는다.
 - **예전 태그로 되돌아갈 때는 `-NoBuild` 필수.** 안 붙이면 현재 소스를 빌드해 예전 이름표를
   붙이므로 진짜 예전 이미지가 사라진다 (CLAUDE.md).
 - `build-and-run.ps1` 은 쿼리 로그가 **켜진** 채로 띄운다. 이어서 `run.ps1` 이
@@ -47,13 +48,20 @@
 
 ## 결과를 믿기 전에 확인할 것
 
-### 1. `route exists (not 404)` 가 100% 인가
+### 1. checks 세 항목이 모두 100% 인가
 
-100% 가 아니면 경로나 `BASE_URL` 이 틀린 것이고 **결과 전체가 무의미하다.**
-요청이 전부 404 로 떨어져도 k6 은 정상 종료하고 카운터는 0 으로 나온다.
+| check | 100% 가 아니면 |
+|---|---|
+| `route exists (not 404)` | 경로나 `BASE_URL` 이 틀렸다. **결과 전체가 무의미하다** |
+| `connected (not status 0)` | TCP 단에서 튕겼다 (아래 2번) |
+| `no server error (not 5xx)` | 앱이 터지고 있다. 측정이 아니라 버그다 |
 
 > mac 원본 `scripts/efficiency/*.js` 와 `create_*.sh` 는 `/api/coupons` 를 호출하는데
 > 실제 컨트롤러 경로는 `/api/v1/coupons` 다. Windows 판본에만 반영되어 있다.
+
+**5xx 검사는 나중에 추가됐다.** single-flight 를 붙일 때 Lua 파일명이 한 글자 틀려
+전 요청이 500 이었는데, 404·status 0 검사만 있던 탓에 **`checks 100%` 로 통과했다.**
+그때 그것을 잡아낸 것은 checks 가 아니라 아래 **"읽어야 할 카운터"** 의 합 불변식이었다.
 
 ### 2. `status_conn_error` 를 같이 읽는다
 
@@ -107,12 +115,17 @@ max 46.59ms 인 실행이 `p(99)<500` 을 넘겼다고 exit 99 를 냈다). 그�
 요청이 캐시 경로를 안 타고 새는 것이다. 카운터를 올리는 곳은 `CouponCacheRepository.getOrLoad`
 한 군데다 (미스면 `couponDbReads`, 히트면 `couponCacheHits`).
 
+**이 트랙에서 가장 먼저 보는 줄이다.** single-flight 를 붙일 때 둘 다 `0` 인데
+`checks 100%` 로 통과한 실행이 있었다 — Lua 파일명이 틀려 카운터를 올리기 **전에** 예외가
+났기 때문이다. 합이 0 이거나 요청 수와 크게 다르면 나머지 숫자는 읽지 않는다.
+
 시나리오 ① (500/s × 30s = 15,000, TTL 1000 / latency 100 기준):
 
-| 태그 | `couponDbReads` | avg | 뜻 |
-|---|---:|---:|---|
-| `cache-4-0` | 15,001 | 272.68ms | 캐시 없음. **Hikari 풀(50) 포화**라 대기가 붙는다 |
-| `rediscache-4-1` | 1,250 | 9.45ms | 캐시는 먹었다. 남은 건 거의 전부 **stampede** — 이론적 바닥은 25건 |
+| 태그 | `couponDbReads` | avg | p(99) | 뜻 |
+|---|---:|---:|---:|---|
+| `cache-4-0` | 15,001 | 272.68ms | 747.91ms | 캐시 없음. **Hikari 풀(50) 포화**라 대기가 붙는다 |
+| `rediscache-4-1` | 1,250 | 9.45ms | 102.37ms | 캐시는 먹었다. 남은 건 거의 전부 **stampede** |
+| `single-flight-4.2` | **27** | 6.88ms | 103.11ms | **이론적 바닥**(사이클당 1건). p99 는 안 움직인다 |
 
 산수와 해석은 `docs/load-test-k6.md` §19. **판정은 p99 가 아니라 이 카운터로 한다** —
 single-flight(4-1b)를 넣어도 대기하는 요청 때문에 p99 는 여전히 튄다.
@@ -144,10 +157,10 @@ $env:COUPON_CACHE_TTL_MS = '10000'      # 덮어쓰려면. compose 가 .env 대�
 단계별 결과가 서로 덮어쓰지 않는다.
 
 ```powershell
-.\build-and-run.ps1 -Tag cache-4-1b     # 다음 단계를 빌드해서 띄운다
+.\build-and-run.ps1 -Tag swr-4.3        # 다음 단계를 빌드해서 띄운다 (태그 이름은 자유)
 .\scripts\efficiency\windows\run.ps1
-#   → build\k6\coupon_burst-cache-4-1b-steady.json
-#   → build\k6\post_sellout_refresh-cache-4-1b-steady.json
+#   → build\k6\coupon_burst-swr-4.3-steady.json
+#   → build\k6\post_sellout_refresh-swr-4.3-steady.json
 
 .\build-and-run.ps1 -Tag cache-4-0 -NoBuild   # 기준선으로 되돌아가 다시 잴 때 (-NoBuild 필수)
 ```
