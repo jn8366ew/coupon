@@ -18,8 +18,7 @@ import java.time.LocalDateTime
 @Service
 class CouponService(
     private val couponRepository: CouponRepository,
-    private val cacheProperties: CacheProperties,
-    private val cacheMetrics: CacheMetrics,
+    private val couponIssuePolicyReader: CouponIssuePolicyReader,
     private val couponIssuer: CouponIssuer,
     private val issuanceRequestProducer: IssuanceRequestProducer,
     private val issuanceCompensator: IssuanceCompensator,
@@ -40,22 +39,16 @@ class CouponService(
 
     @Transactional
     fun issue(couponId: Long, userId: Long): Issuance {
-        cacheMetrics.incrementCouponDbRead()
-        // 이걸 넣은 이유는 DB에 조회하는 응답하는 속도를 의미를 늦추기 위함
-        // 로컬은 너무 빨라서 100ms 늦춰서 테스트 해보려 함.
-        // DB를 조회핧때랑 캐시 조회할때랑 차이가 난다고 강의에서 이야기 함
-        Thread.sleep(cacheProperties.simulatedLoadLatencyMs)
-        val coupon = couponRepository.findById(couponId)
-            .orElseThrow { CouponNotFoundException() }
+        val policy = couponIssuePolicyReader.get(couponId)
 
         val now = LocalDateTime.now()
-        if (!coupon.isBookingOpen(now)) {
+        if (!policy.isBookingOpen(now)) {
             throw NotStartedException()
         }
 
         couponIssuer.tryIssue(couponId, userId)
 
-        val expiresAt = now.plusDays(coupon.validityDays.toLong())
+        val expiresAt = now.plusDays(policy.validityDays.toLong())
         val event = IssuanceRequested(
             couponId = couponId,
             userId = userId,

@@ -272,10 +272,15 @@ if (($containerEnv -match 'SPRING_JPA_SHOW_SQL=false').Count -eq 0) {
 }
 Write-Host "쿼리 로그 꺼짐 확인 (SPRING_JPA_SHOW_SQL=false)" -ForegroundColor DarkGray
 
-# 캐시 TTL 은 하네스가 강제하지 않는다. 어떤 값으로 쟀는지는 남겨 둬야 나중에 비교가 된다.
-$ttlLine = @($containerEnv) | Where-Object { $_ -like 'COUPON_CACHE_TTL_MS=*' } | Select-Object -First 1
-$ttl = if ($ttlLine) { ($ttlLine -split '=', 2)[1] } else { '10000 (application.yaml 기본값)' }
-Write-Host "COUPON_CACHE_TTL_MS = $ttl" -ForegroundColor DarkGray
+# 캐시 설정은 하네스가 강제하지 않는다 (docker-compose.yml 이 기본값을 준다).
+# 이 두 값이 이 트랙 수치의 의미를 통째로 바꾸므로 어떤 조건에서 쟀는지 반드시 남긴다.
+# 실제로 4-0 은 latency=0, 4-1 은 latency=100 에서 쟀는데 로그에 그게 없어서
+# p99 가 1.45ms -> 102ms 로 "나빠진" 것처럼 보였다. 회귀가 아니라 워크로드가 바뀐 것이었다.
+foreach ($name in 'COUPON_CACHE_TTL_MS', 'COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS') {
+    $line = @($containerEnv) | Where-Object { $_ -like "$name=*" } | Select-Object -First 1
+    $value = if ($line) { ($line -split '=', 2)[1] } else { '(미설정 — application.yaml 기본값)' }
+    Write-Host "$name = $value" -ForegroundColor DarkGray
+}
 
 # 어떤 구현을 쟀는지 남긴다. .env 가 아니라 실제로 떠 있는 컨테이너에서 읽는다.
 $runningImage = docker inspect --format '{{.Config.Image}}' $containerId

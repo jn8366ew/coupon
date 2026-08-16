@@ -103,18 +103,40 @@ max 46.59ms 인 실행이 `p(99)<500` 을 넘겼다고 exit 99 를 냈다). 그�
 | `soldOutRedisExists` | ② | 매진 판정을 위해 Redis 까지 간 횟수 |
 | `soldOutFastPathHits` | ② | 컨트롤러 진입 직후 잘린 횟수. 시그널 적용 후 요청 수에 수렴해야 한다 |
 
-**현재(4-0) 기준선**: `CouponService.issue` 는 캐시 없이 매 요청 `incrementCouponDbRead()` 를 부르므로
-`couponDbReads == 요청 수` 가 정상이다. 이게 줄어드는 것을 보는 게 이 트랙의 목적이다.
+**`couponDbReads + couponCacheHits` 는 요청 수와 정확히 맞아야 한다.** 모자라면 어딘가에서
+요청이 캐시 경로를 안 타고 새는 것이다. 카운터를 올리는 곳은 `CouponCacheRepository.getOrLoad`
+한 군데다 (미스면 `couponDbReads`, 히트면 `couponCacheHits`).
 
-## 하네스가 강제하지 않는 것
+시나리오 ① (500/s × 30s = 15,000, TTL 1000 / latency 100 기준):
 
-| 환경변수 | 기본값 | 주의 |
+| 태그 | `couponDbReads` | avg | 뜻 |
+|---|---:|---:|---|
+| `cache-4-0` | 15,001 | 272.68ms | 캐시 없음. **Hikari 풀(50) 포화**라 대기가 붙는다 |
+| `rediscache-4-1` | 1,250 | 9.45ms | 캐시는 먹었다. 남은 건 거의 전부 **stampede** — 이론적 바닥은 25건 |
+
+산수와 해석은 `docs/load-test-k6.md` §19. **판정은 p99 가 아니라 이 카운터로 한다** —
+single-flight(4-1b)를 넣어도 대기하는 요청 때문에 p99 는 여전히 튄다.
+
+## 측정 조건 — 결과를 비교하기 전에 이것부터 맞춘다
+
+이 두 값이 이 트랙 수치의 의미를 통째로 바꾼다. `docker-compose.yml` 이 기본값을 주고,
+셸에서 같은 이름의 환경변수로 덮을 수 있다. **하네스는 강제하지 않는다** — 대신
+`run.ps1` 이 시작할 때 컨테이너에 실제로 적용된 값을 두 줄로 찍는다.
+
+| 환경변수 | compose 기본값 | 뜻 |
 |---|---|---|
-| `COUPON_CACHE_TTL_MS` | `10000` | 원본 `coupon_burst.js` 주석은 TTL=1000 전제로 쓰여 있다. 여기서는 강제하지 않는다 — 강의가 남아 있어 나중에 바뀔 값이다. `run.ps1` 이 실제 적용값을 시작할 때 찍는다 |
-| `COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS` | `0` | `CouponService.issue` 가 **매 요청** `Thread.sleep` 한다. 0 이 아니면 이 트랙 수치가 전부 바뀐다 |
+| `COUPON_CACHE_TTL_MS` | `1000` | 캐시 만료. 짧을수록 stampede 윈도우가 자주 온다 |
+| `COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS` | `100` | DB 조회에 심는 인위적 지연 (`CouponIssuePolicyReader` 의 `Thread.sleep`). `0` 이면 조회가 1ms 라 캐시 효과가 p99 에 아예 안 드러난다 |
 
-둘 중 하나라도 바꾸면 기존 측정 기록과 비교가 성립하지 않는다. 바꿔야 한다면
-그 사실을 문서에 명시하고 전 구현을 다시 잰다 (CLAUDE.md).
+```powershell
+$env:COUPON_CACHE_TTL_MS = '10000'      # 덮어쓰려면. compose 가 .env 대신 셸 환경변수를 본다
+```
+
+**둘 중 하나라도 다르면 기존 측정 기록과 비교가 성립하지 않는다.** 실제로 4-0 은 `10000/0`,
+4-1 은 `1000/100` 에서 쟀고, 그 탓에 p99 가 1.45ms → 102ms 로 "나빠진" 것처럼 보였다
+(회귀가 아니라 워크로드가 바뀐 것이다 — `docs/load-test-k6.md` §18·§19).
+그래서 **결과를 읽기 전에 로그 맨 위의 두 줄을 먼저 본다.**
+바꿔야 한다면 그 사실을 문서에 명시하고 전 구현을 다시 잰다 (CLAUDE.md).
 
 ## 구현 전환
 

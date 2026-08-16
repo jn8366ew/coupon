@@ -17,9 +17,16 @@
 //   - p99 응답 시간 (issue_policy_latency)
 //   - couponDbReads (k6 직전 /metrics/cache/reset 으로 0 -> 종료 후 /metrics/cache GET)
 //
-// TTL 주의: 원본 주석은 COUPON_CACHE_TTL_MS=1000 으로 1초를 강제한 상태를 전제로 쓰여 있다.
-// 이 하네스는 TTL 을 강제하지 않는다 — application.yaml 의 기본값 10000 (10초) 으로 돈다.
-// 즉 30초 동안 TTL 만료가 3번쯤만 생기므로 stampede 윈도우도 그만큼만 관찰된다.
+// 조건 주의: 이 시나리오의 수치는 아래 두 값에 통째로 좌우된다.
+// docker-compose.yml 이 기본값을 주고(TTL 1000ms, 조회 지연 100ms), 셸에서 같은 이름의
+// 환경변수로 덮을 수 있다. 하네스는 강제하지 않고 run.ps1 이 실제 적용값을 찍기만 한다.
+//
+//   COUPON_CACHE_TTL_MS                     1000  캐시 만료. 짧을수록 stampede 윈도우가 자주 온다
+//   COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS   100  DB 조회에 심는 인위적 지연.
+//                                                 0 이면 조회가 1ms 라 캐시 효과가 p99 에 안 드러난다
+//
+// 둘 중 하나라도 다르면 이전 측정과 비교가 성립하지 않는다. 실제로 4-0 은 10000/0,
+// 4-1 은 1000/100 에서 쟀다 (docs/load-test-k6.md §18, §19).
 import http from 'k6/http';
 import { check } from 'k6';
 import { Trend, Counter } from 'k6/metrics'; // Trend: 분포 (avg/p95/p99), Counter: 누적 합
