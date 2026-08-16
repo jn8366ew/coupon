@@ -256,17 +256,23 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 
 ## 6. 부하 테스트 하네스
 
-**하네스는 두 트랙이다.** 재는 것이 다르면 시나리오도 검증도 달라야 하기 때문이다.
+**하네스는 세 트랙이다.** 재는 것이 다르면 시나리오도 검증도 달라야 하기 때문이다.
 
 | 트랙 | 재는 것 | 한 줄 실행 |
 |---|---|---|
 | `scripts/concurrency/` | 정확성 — 과발급·중복발급·카운터 일치 | `.\scripts\concurrency\windows\load-test.ps1 <시나리오>` |
 | `scripts/response/` | 응답시간 — `issue_latency` 분포(P99), 부하 전달률 | `.\scripts\response\windows\run.ps1` |
+| `scripts/efficiency/` | 효율 — 같은 결과를 내는 비용(`couponDbReads`, 매진 후 헛도는 요청) | `.\scripts\efficiency\windows\run.ps1` |
 
 각 트랙 안에서 Windows 판은 `<트랙>/windows/`, mac 원본(bash + 로컬 k6)은 `<트랙>/load/` 또는
 트랙 루트에 있다. **mac 판은 수정하지 않는다.** 두 판본의 부하 조건(rate, VU, USER_POOL)이
-같아야 결과를 비교할 수 있고, 실제로 두 트랙도 같은 조건을 쓴다
+같아야 결과를 비교할 수 있고, 정확성·응답시간 트랙은 서로도 같은 조건을 쓴다
 (`constant-arrival-rate` 5,000/s × 30s, USER_POOL 20,000, 재고 5,000).
+
+**efficiency 트랙만 부하 조건이 다르다.** 재는 대상이 응답시간이 아니라 "요청 한 건이 만드는 일" 이라
+시나리오마다 조건을 따로 잡았다 — ① 쿠폰 정보 조회 급증은 500/s × 30s (재고 1, `startsAt` 미래라
+전부 NotStarted), ② 매진 후 새로고침은 4,000/s × 30s (재고 100 을 미리 매진시켜 둔다).
+그래서 이 트랙의 p99 는 다른 두 트랙의 p99 와 나란히 놓고 비교하면 안 된다.
 
 ### 역할 분담
 
@@ -275,24 +281,32 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 | `build-and-run.ps1` | jib 로 이미지 빌드 → `docker load` → 태그를 `.env` 에 기록 → compose 기동 |
 | `concurrency/windows/load-test.ps1` | 쿼리 로그 끄기 → 리셋 → 쿠폰 생성 → k6 → 카운터 동기화 대기 → 검증 |
 | `response/windows/run.ps1` | 위와 같되 **워밍업 1회 + 본 측정 1회**, 검증은 드레인 폴링 |
+| `efficiency/windows/run.ps1` | 위와 같되 **시나리오 2종**(`-Scenario policy\|sellout`), 검증 대신 `/metrics/cache` 카운터 출력 |
+| `efficiency/windows/sell-out.ps1` | 100명 순차 발급 → Redis 재고가 0 이 될 때까지 폴링. 매진 안 되면 멈춘다 |
 | `<트랙>/windows/reset.ps1` | `coupon` / `issuance` TRUNCATE + Redis `FLUSHALL` |
 | `<트랙>/windows/create-coupon.ps1` | 쿠폰 1개 생성하고 ID 를 표준출력으로 반환 |
 | `concurrency/windows/verify.ps1` | 판정 SQL 실행 → 과발급/카운터 일치 여부 출력 |
 | `response/windows/verify-burst.ps1` | 쓰기가 멈출 때까지 폴링 → 위 판정 + **Redis 잔여 재고** |
 | `<트랙>/windows/k6/*.js` | k6 시나리오 |
 
-`reset.ps1` / `create-coupon.ps1` 은 두 트랙에 **일부러 복제**해 두었다. 한쪽 하네스를 고치다
+`reset.ps1` 과 쿠폰 생성 스크립트는 세 트랙에 **일부러 복제**해 두었다. 한쪽 하네스를 고치다
 다른 쪽 측정 조건이 조용히 바뀌는 것을 막기 위해서다.
+(efficiency 는 시나리오가 둘이라 `create-issue-policy-coupon.ps1` / `create-small-coupon.ps1` 로 나뉜다.)
 
-### 응답시간 트랙에만 있는 것
+### 워밍업·드레인·`status 0`
 
 - **워밍업 라운드.** 1회차는 버린다. JIT·Hikari 풀이 데워지는 비용이 섞이기 때문이다.
-  실측으로 1회차 p99 102.93ms → 2회차 5.61ms 로 18배 차이가 났다
+  실측으로 1회차 p99 102.93ms → 2회차 5.61ms 로 18배 차이가 났다.
+  응답시간·efficiency 트랙이 쓴다 (`-Once` 로 끄면 그 수치는 구현 비교에 쓰지 않는다)
 - **드레인 폴링.** 큐 구현에서는 k6 이 끝나도 워커가 계속 쓴다. `issuance` 행 수가 멈출 때까지
-  기다린 뒤 검증한다. 이 폴링이 끝난 뒤에 다음 라운드의 리셋이 돌므로 라운드끼리 안 섞인다
+  기다린 뒤 검증한다. 이 폴링이 끝난 뒤에 다음 라운드의 리셋이 돌므로 라운드끼리 안 섞인다.
+  **응답시간 트랙에만 있다.** efficiency 는 검증 대신 카운터를 읽으므로 드레인을 기다리지 않고,
+  대신 `sell-out.ps1` 이 재고 카운터가 0 이 되는 것을 폴링해 사전 조건을 보장한다
 - **`status 0` 을 지연 분포에서 제외.** 연결 거부는 `duration ≈ 0ms` 로 기록돼 p99 를
   실제보다 좋게 만든다. `status_conn_error` 로 따로 세고 같이 읽는다
-  ([`load-test-k6.md` §13.2](load-test-k6.md))
+  ([`load-test-k6.md` §13.2](load-test-k6.md)).
+  **efficiency 트랙도 같은 처리를 한다** — 특히 매진 시그널의 fast-path 효과를 볼 때
+  이걸 안 빼면 "빨라진 것" 과 "튕긴 것" 이 구분되지 않는다
 
 ### compose 구성 (`docker-compose.yml`)
 
@@ -368,6 +382,19 @@ docker compose exec redis redis-cli GET coupon:1:stock
 | 쿼리 로그 | `docker inspect` 로 컨테이너 환경변수 (`load-test.ps1` 이 자동으로 한다) |
 | 이미지 태그 | 측정 시작 시 출력되는 `측정 대상 이미지: coupon-service:...` |
 | Hikari 풀 크기 | `SHOW GLOBAL STATUS LIKE 'Max_used_connections'` — 풀 50 이면 51 정도가 나온다 |
+| 측정 대상 기능 자체 | 러너가 라운드 전에 엔드포인트를 직접 호출해 본다 (`efficiency/windows/run.ps1` 의 `/metrics/cache` 프로브) |
+
+**태그가 맞다고 그 이미지에 기능이 있는 건 아니다.** `.env` 의 태그와 `측정 대상 이미지:` 출력이
+둘 다 맞아도, 그 태그가 기능이 들어가기 **전에** 빌드된 것일 수 있다. efficiency 트랙을 처음
+붙일 때 실제로 그럴 뻔했다 — 예전 태그에는 `CacheMetricsController` 가 없어 `/metrics/cache/reset`
+이 404 인데, 그게 **리셋과 쿠폰 생성을 다 마친 뒤** 터진다. 데이터는 이미 날아갔고 화면에는
+왜 죽었는지 안 나온다. 그래서 러너는 라운드에 들어가기 **전에** 기능을 직접 확인하고,
+없으면 빌드 커맨드를 안내하고 멈춘다.
+
+**빌드는 러너가 하지 않는다.** `build-and-run.ps1` 몫이다 — 태그 이름은 사람이 고를 일이고,
+예전 태그로 되돌아갈 때 `-NoBuild` 를 빼먹으면 그 이미지가 덮이기 때문이다(위 항목).
+새 기능을 재는 트랙을 만들 때는 **새 태그로 빌드해야 한다는 것 자체가 사전 조건**이므로
+트랙 README 맨 위에 적는다.
 
 **k6 검사에 `status !== 0` 이 필요하다.** 연결 실패 시 k6 의 `res.status` 는 0 인데
 `0 !== 404` 는 참이라 404 검사만으로는 통과해 버린다. 요청의 66% 가 앱에 닿지도 않았는데
@@ -426,6 +453,10 @@ docker compose logs coupon-service | Select-String 'IssuanceCompensator'   # ASC
 
 **mac 판 스크립트와 `scripts/concurrency/api.sh` 는 `/api/coupons` 를 호출한다.**
 실제 컨트롤러 경로는 `/api/v1/coupons` 라 그대로 돌리면 전부 404 다. Windows 판에만 반영되어 있다.
+`scripts/efficiency/` 의 mac 원본(`*.js`, `create_*.sh`)도 마찬가지고, 거기다 `efficiency/run.sh` 는
+이 저장소에 없는 경로(`scripts/load/part-4/…`)를 참조한다 — 강의 원본 레이아웃이다.
+**새 트랙을 옮길 때 경로를 가장 먼저 의심할 것.** 전 요청이 404 여도 k6 은 정상 종료하므로,
+`route exists (not 404)` check 가 없으면 "결함 없음" 이라는 정반대 결론이 나온다.
 
 **k6 컨테이너에는 `./scripts` 를 통째로 마운트한다.** 트랙별 하위 디렉터리를 각각 마운트하면
 디렉터리를 옮길 때마다 조용히 깨진다 — 실제로 한 번 깨졌다. 없는 호스트 경로를 마운트하면

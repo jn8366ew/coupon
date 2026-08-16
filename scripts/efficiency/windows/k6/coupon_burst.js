@@ -1,0 +1,90 @@
+// 시나리오 ①: 발급 API 의 쿠폰 정보 조회 요청 급증. 캐시 stampede 와 단계별 해소를 본다.
+//
+// scripts/efficiency/coupon_burst.js (mac 로컬 k6 용) 의 Windows/Docker 판본.
+// 부하 조건(rate, VU, duration)은 두 판본이 같아야 결과를 비교할 수 있다.
+//
+// 원본에서 바꾼 것은 다섯 가지뿐이고, 넷은 이 저장소에서 실제로 당한 함정에 대한 대응이다.
+//   1. 경로 /api/coupons -> /api/v1/coupons   (원본대로면 전 요청 404)
+//   2. check() 두 개 추가                     (404·연결실패를 조용히 통과시키지 않으려고)
+//   3. status 0 을 지연 분포에서 제외          (아래 "왜 status 0 을 빼는가")
+//   4. summaryTrendStats 에 p(99) 추가        (기본 요약은 p(95) 까지만 낸다)
+//   5. 409 카운터 추가                        (아래 "왜 409 가 정상인가")
+//
+// 시작 전 쿠폰에 POST /api/v1/coupons/{id}/issue 를 500 req/s 로 30초간 쏟아붓는다.
+// issue 는 NotStarted 로 끝나므로 재고 차감이나 Kafka 발행 없이 쿠폰 정보 조회까지만 실행한다.
+//
+// 측정 포인트:
+//   - p99 응답 시간 (issue_policy_latency)
+//   - couponDbReads (k6 직전 /metrics/cache/reset 으로 0 -> 종료 후 /metrics/cache GET)
+//
+// TTL 주의: 원본 주석은 COUPON_CACHE_TTL_MS=1000 으로 1초를 강제한 상태를 전제로 쓰여 있다.
+// 이 하네스는 TTL 을 강제하지 않는다 — application.yaml 의 기본값 10000 (10초) 으로 돈다.
+// 즉 30초 동안 TTL 만료가 3번쯤만 생기므로 stampede 윈도우도 그만큼만 관찰된다.
+import http from 'k6/http';
+import { check } from 'k6';
+import { Trend, Counter } from 'k6/metrics'; // Trend: 분포 (avg/p95/p99), Counter: 누적 합
+
+// compose 의 k6 서비스가 http://coupon-service:8080 을 넣어준다.
+// 기본값은 나중에 로컬에 k6 을 설치해 직접 돌릴 경우를 위해 남겨둔다.
+const BASE = __ENV.BASE_URL || 'http://localhost:8080';
+const COUPON_ID = __ENV.COUPON_ID || '1';        // docker compose run -e COUPON_ID=... 로 주입
+
+const issuePolicyLatency = new Trend('issue_policy_latency', true);
+const status2xx = new Counter('status_2xx');
+// 왜 409 가 정상인가
+//   startsAt 이 미래인 쿠폰이라 NotStartedException 이 던져지고, 그건 HTTP 409 다
+//   (support/DomainException.kt). 즉 이 시나리오는 요청 전부가 409 로 끝나는 것이 정상이다.
+//   원본은 이걸 status_other 로 뭉뚱그려서 "전부 비정상" 처럼 보인다.
+const status409 = new Counter('status_409_not_started');
+const statusOther = new Counter('status_other');
+// status 0 = 앱이 응답한 게 아니라 TCP 단에서 튕긴 것. 아래 이유로 따로 센다.
+const statusConnError = new Counter('status_conn_error');
+
+export const options = {
+    scenarios: {
+        issue_policy_burst: {
+            executor: 'constant-arrival-rate',
+            rate: 500, timeUnit: '1s', duration: '30s',  // 500 req/s × 30s = 15,000 회
+            preAllocatedVUs: 500, maxVUs: 1000,
+        },
+    },
+    // 기본 요약은 p(90)/p(95) 까지만 낸다. 이 트랙의 관심사가 p99 라 명시적으로 넣는다.
+    summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
+    // single-flight 도입 (4-1b) 이후엔 stampede 윈도우 안의 P99 가 여전히 튀므로
+    // threshold 깨지는 게 정상. SWR (4-1c) 에서 통과.
+    // (k6 은 threshold 가 깨지면 exit 99 를 낸다. run.ps1 이 그 코드를 허용한다.)
+    thresholds: {
+        'issue_policy_latency': ['p(99)<200'],
+    },
+};
+
+export default function () {
+    const userId = String(6000000000 + __VU);
+    const res = http.post(`${BASE}/api/v1/coupons/${COUPON_ID}/issue`, null, {
+        headers: { 'X-User-Id': userId },
+    });
+
+    check(res, {
+        // 404 면 경로나 BASE_URL 이 틀린 것. 이 검사가 없으면 전 요청이 404 여도
+        // k6 은 조용히 성공하고 카운터만 0 으로 나온다.
+        'route exists (not 404)': (r) => r.status !== 404,
+        // status 0 = 연결 자체가 실패(거절/타임아웃). 404 검사만으로는 0 을 못 잡는다.
+        'connected (not status 0)': (r) => r.status !== 0,
+    });
+
+    // 왜 status 0 을 지연 분포에서 빼는가
+    //
+    //   연결이 거부되면 res.timings.duration 이 0ms 에 가깝게 기록된다. 그대로 Trend 에 넣으면
+    //   "빠른 응답" 이 대량으로 섞여 p99 가 실제보다 좋게 나온다 (docs/load-test-k6.md 12.7.3).
+    //   그래서 issue_policy_latency 는 "앱이 실제로 응답한 요청의 분포" 다.
+    //   status_conn_error 가 크면 그만큼 살아남은 요청만 본 수치라는 뜻이므로 같이 읽어야 한다.
+    if (res.status === 0) {
+        statusConnError.add(1);
+        return;
+    }
+
+    issuePolicyLatency.add(res.timings.duration);
+    if (res.status >= 200 && res.status < 300) status2xx.add(1);
+    else if (res.status === 409) status409.add(1);   // NotStarted — 이 시나리오의 정상 응답
+    else statusOther.add(1);                         // 5xx, 타임아웃 등 비정상
+}
