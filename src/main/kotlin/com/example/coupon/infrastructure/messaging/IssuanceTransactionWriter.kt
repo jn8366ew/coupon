@@ -1,5 +1,6 @@
 package com.example.coupon.infrastructure.messaging
 
+import com.example.coupon.domain.CouponRepository
 import com.example.coupon.domain.Issuance
 import com.example.coupon.domain.IssuanceRepository
 import org.springframework.stereotype.Component
@@ -16,17 +17,25 @@ import org.springframework.transaction.annotation.Transactional
 @Component
 class IssuanceTransactionWriter(
     private val issuanceRepository: IssuanceRepository,
+    private val couponRepository: CouponRepository,
 ) {
 
     @Transactional
-    fun insert(event: IssuanceRequested){
+    fun insertAndIncrement(event: IssuanceRequested) {
+        // 한번더 정합성 검사 하면 좋을것 같음
+        if (issuanceRepository.existsByUserIdAndCouponId(event.userId, event.couponId)) return
+
         issuanceRepository.save(
             Issuance(
                 userId = event.userId,
                 couponId = event.couponId,
-                issuedAt = event.issueAt,
+                issuedAt = event.issuedAt,
                 expiresAt = event.expiresAt,
             )
         )
+        couponRepository.incrementIssueQuantity(event.couponId)
     }
+
+    fun isAlreadyApplied(event: IssuanceRequested): Boolean =
+        issuanceRepository.existsByUserIdAndCouponId(event.userId, event.couponId)
 }

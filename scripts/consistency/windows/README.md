@@ -100,9 +100,13 @@ DB 불일치     = 총 수량 - coupon.issued_quantity - Redis 잔여 재고
 
 ## 알아둘 함정
 
-**`force-dlt` 가 넣는 JSON 키는 `issuedAt` 인데 `IssuanceRequested` 의 필드명은 `issueAt` 이다.**
-part-5-0 에서는 이 메시지를 아무도 읽지 않아 문제가 없다. part-5-1 에서 replay 를 붙이는 순간
-역직렬화가 여기서 먼저 깨진다. 원본과 맞춰 두었으니 그때 둘 중 하나를 맞출 것.
+**`force-dlt` 의 JSON 키와 `IssuanceRequested` 의 필드명은 항상 같이 움직여야 한다 (`issuedAt`).**
+한때 앱 필드가 `issueAt` 이라 part-5-1 의 replay 가 `KotlinInvalidNullException` 으로 500 을 냈다.
+스크립트가 아니라 **앱 쪽을 `issuedAt` 으로 맞췄다** — 강의를 따라가는 것이 기준이기 때문이다
+(`IssuanceRequested.kt`, `CouponService.kt`, `IssuanceTransactionWriter.kt` 세 곳).
+
+바꾼 뒤에는 **DLT 토픽에 남아 있던 예전 메시지가 못 읽힌다.** `run.ps1` 이 part-5-1 시작 시
+kafka 를 `--force-recreate` 해서 토픽을 비우므로 보통은 저절로 해결된다.
 
 **Kafka 에 넣을 때 PowerShell 파이프라인을 쓰지 않는다.** 파이프라인은 줄바꿈을 CRLF 로
 내보내므로 메시지 값 끝에 `\r` 이 붙는다. 화면상 멀쩡해 보이고 JSON 파싱만 조용히 깨지는
@@ -131,9 +135,13 @@ compose 가 전달하지 않는다. part-5-2 에 들어갈 때 두 줄을 추가
 통째로 사라진다.** part-5-1/5-2 시작 시점을 깨끗이 하려는 의도지만, 그 전에 주입해 둔 DLT
 메시지도 같이 없어진다. part-5-0 은 재기동하지 않으므로 영향이 없다.
 
-**`reset.ps1` 은 Redis 도 `FLUSHALL` 한다. 빼지 말 것.** TRUNCATE 로 `coupon.id` 가 1 부터
+**`reset.ps1` 은 Redis 도 비운다(`FLUSHDB`). 빼지 말 것.** TRUNCATE 로 `coupon.id` 가 1 부터
 다시 시작하므로, 안 비우면 이전 실행의 `coupon:1:users` 를 물려받아 **주입하지도 않은 불일치**가
 집계된다. 이 트랙은 그 숫자를 세는 것이라 곧바로 가짜 결과가 된다.
+
+**`issuance_dlt_log` 는 있을 때만 비운다.** part-5-1 에서 생기는 테이블이라 지금은 없다.
+없는 상태로 `TRUNCATE` 하면 리셋 전체가 죽고 그 뒤 라운드가 통째로 안 돈다.
+그래서 `information_schema` 로 존재를 먼저 확인한다 (원본 `reset.sh` 와 같은 방식).
 
 **mac 원본은 이 저장소에서 그대로 돌지 않는다.** `scripts/load/part-5/…`, `scripts/load/reset.sh`
 같은 강의 저장소 레이아웃을 참조하고, 패키지도 `com.apiece` 이며, `date -u -v+7d` 는 BSD 전용이다.
@@ -144,7 +152,7 @@ Windows 판에만 반영되어 있다.
 | 파일 | 원본 | 하는 일 |
 |---|---|---|
 | `run.ps1` | `run.sh` + `_common.sh` | 단계 감지 → 시나리오 실행 → 검증 |
-| `reset.ps1` | (`scripts/load/reset.sh`) | TRUNCATE + `FLUSHALL` |
+| `reset.ps1` | `scripts/concurrency/load/reset.sh` | `coupon`/`issuance`(+있으면 `issuance_dlt_log`) TRUNCATE + `FLUSHDB` |
 | `create-coupon.ps1` | (`scripts/load/create_coupon.sh`) | 재고 5000 쿠폰 1개 생성, ID 반환 |
 | `drift-report.ps1` | `drift_report.sh` | 지금 얼마나 어긋났는지 출력 |
 | `force-dlt.ps1` | `force_dlt.sh` | DB 저장 실패 상황 주입 |

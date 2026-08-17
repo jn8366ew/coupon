@@ -1,19 +1,24 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    coupon / issuance 테이블과 Redis 를 비운다.
+    coupon / issuance / issuance_dlt_log 테이블과 Redis 를 비운다.
 
 .DESCRIPTION
-    정합성 트랙(scripts/consistency)용. 다른 트랙의 reset.ps1 과 동작이 같다.
+    scripts/concurrency/load/reset.sh 의 Windows 판본. 정합성 트랙(scripts/consistency)용이다.
     트랙끼리 공유하지 않고 일부러 복제해 두었다 — 한쪽 하네스를 고치다
     다른 쪽 조건이 조용히 바뀌는 것을 막기 위해서다.
 
     강의 원본(run.sh)은 ./scripts/load/reset.sh 를 부르지만 이 저장소에는 그 경로가 없다.
     트랙 재편 전 레이아웃이라 그대로 두면 "파일 없음" 으로 죽는다.
 
+    issuance_dlt_log 는 part-5-1 에서 생기는 테이블이라 지금은 없을 수 있다.
+    information_schema 로 존재를 먼저 확인하고 있을 때만 TRUNCATE 한다 —
+    없는 테이블을 TRUNCATE 하면 리셋 전체가 죽고, 그러면 그 뒤 라운드가 통째로 안 돈다.
+
     Redis 를 같이 비우는 것이 중요하다. TRUNCATE 로 coupon.id 가 1 부터 다시 시작하므로,
     안 비우면 이전 실행이 남긴 coupon:1:users / coupon:1:stock 을 그대로 물려받는다.
     이 트랙은 "DB 와 Redis 가 얼마나 어긋났는가" 를 세는 것이라 그 잔재가 곧 가짜 불일치가 된다.
+    FLUSHALL 이 아니라 FLUSHDB 다 (원본과 동일). 앱은 0번 DB 만 쓰므로 결과는 같다.
 
     Kafka 토픽은 비우지 않는다. 이 트랙은 일부러 DLT 에 메시지를 넣으므로
     지우면 주입한 것까지 사라진다 (run.ps1 의 Restart-CouponService 는 kafka 를
@@ -31,14 +36,42 @@ $ErrorActionPreference = 'Stop'
 # (scripts/consistency/windows -> 세 단계 위)
 Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..\..')
 
+function Invoke-MysqlScalar {
+    param([Parameter(Mandatory)][string]$Sql)
+
+    $out = docker compose exec -T -e MYSQL_PWD=coupon mysql mysql -ucoupon -BN coupon -e $Sql
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "!! MySQL 실패 (exit code $LASTEXITCODE). 컨테이너가 떠 있는지 확인하세요." -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+
+    $line = ($out | Where-Object { $_ -match '\S' } | Select-Object -First 1)
+    if ($null -eq $line) { return '' }
+    return $line.Trim()
+}
+
+Write-Host ""
+Write-Host "===== coupon, issuance 데이터 리셋 =====" -ForegroundColor Cyan
+
+# issuance_dlt_log 는 part-5-1 에서 생긴다. 없는 상태로 TRUNCATE 하면 리셋이 통째로 죽는다.
+$dltLogExists = Invoke-MysqlScalar -Sql @'
+SELECT COUNT(*) FROM information_schema.tables
+WHERE table_schema='coupon' AND table_name='issuance_dlt_log'
+'@
+
+if ($dltLogExists -eq '1') {
+    Invoke-MysqlScalar -Sql 'TRUNCATE TABLE issuance_dlt_log' | Out-Null
+    Write-Host "issuance_dlt_log 비움" -ForegroundColor DarkGray
+}
+else {
+    Write-Host "issuance_dlt_log 없음 — 건너뜀 (part-5-1 부터 생긴다)" -ForegroundColor DarkGray
+}
+
 $sql = @'
 SET FOREIGN_KEY_CHECKS=0; TRUNCATE issuance; TRUNCATE coupon; SET FOREIGN_KEY_CHECKS=1;
 SELECT (SELECT COUNT(*) FROM coupon)   AS coupon_rows,
        (SELECT COUNT(*) FROM issuance) AS issuance_rows;
 '@
-
-Write-Host ""
-Write-Host "===== coupon, issuance 데이터 리셋 =====" -ForegroundColor Cyan
 
 docker compose exec -T -e MYSQL_PWD=coupon mysql mysql -ucoupon -t coupon -e $sql
 
@@ -48,7 +81,10 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-docker compose exec -T redis redis-cli FLUSHALL
+Write-Host ""
+Write-Host "===== redis 데이터 리셋 (FLUSHDB) =====" -ForegroundColor Cyan
+
+docker compose exec -T redis redis-cli FLUSHDB
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "!! Redis 리셋 실패 (exit code $LASTEXITCODE)." -ForegroundColor Red

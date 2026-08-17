@@ -58,7 +58,7 @@ class CouponService(
         val event = IssuanceRequested(
             couponId = couponId,
             userId = userId,
-            issueAt = now,
+            issuedAt = now,
             expiresAt = expiresAt,
         )
 

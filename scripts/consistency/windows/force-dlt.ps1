@@ -12,10 +12,9 @@
 
     DLT 재처리(part-5-1)가 되살려야 하는 쪽이다.
 
-    ! 원본이 만드는 JSON 의 키는 issuedAt 인데 이 저장소의 IssuanceRequested 필드명은
-      issueAt 이다. part-5-0 에서는 이 메시지를 아무도 읽지 않아 문제가 없지만,
-      part-5-1 에서 replay 를 붙이면 역직렬화가 여기서 먼저 깨진다.
-      원본과 맞춰 두었으니 그 단계에 가서 둘 중 하나를 맞출 것.
+    JSON 키는 강의 원본 그대로 issuedAt 이다. 한때 앱의 IssuanceRequested 필드가 issueAt 이라
+    replay 가 KotlinInvalidNullException 으로 500 을 냈는데, 스크립트가 아니라 앱 쪽을
+    issuedAt 으로 맞췄다 (강의를 따라가는 것이 기준이다). 둘은 항상 같이 움직여야 한다.
 
     Kafka 프로듀서에 PowerShell 파이프라인으로 문자열을 직접 넣지 않는다.
     파이프라인은 줄바꿈을 CRLF 로 내보내므로 메시지 값 끝에 \r 이 붙어 버린다 —

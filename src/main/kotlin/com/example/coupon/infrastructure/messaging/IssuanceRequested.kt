@@ -5,6 +5,6 @@ import java.time.LocalDateTime
 class IssuanceRequested(
     val couponId: Long,
     val userId: Long,
-    val issueAt: LocalDateTime,
+    val issuedAt: LocalDateTime,
     val expiresAt: LocalDateTime
 )
