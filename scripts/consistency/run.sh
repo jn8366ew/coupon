@@ -48,26 +48,33 @@ dlt_replay() {
 }
 
 reconcile() {
-  export COUPON_RECONCILE_AUDIT_CRON="0 0 0 1 1 *"
   restart_service 3600000
+
+  printf '\n\033[1;35m##### 최근 대사 대상 등록 #####\033[0m\n'
+  ./scripts/load/reset.sh >/dev/null
+  cid="$(./scripts/load/create_coupon.sh)"
+  curl -fsS -X POST "$BASE/api/coupons/$cid/issue" -H 'X-User-Id: 800001' >/dev/null
+  [[ -n "$(redis_cli ZSCORE coupon:reconcile:recent "$cid")" ]] && pass "발급 쿠폰을 최근 대사 대상으로 등록" || ng "발급 쿠폰을 최근 대사 대상으로 등록"
+  for _ in $(seq 1 30); do
+    [[ "$(mysql_scalar "SELECT COUNT(*) FROM issuance WHERE coupon_id=$cid AND user_id=800001")" == "1" ]] && break
+    sleep 1
+  done
 
   printf '\n\033[1;35m##### Redis users 누락 자동 보정 #####\033[0m\n'
   ./scripts/load/reset.sh >/dev/null
-  curl -fsS -X POST "$BASE/metrics/reconcile/reset" >/dev/null
   cid="$(./scripts/load/create_coupon.sh)"
   COUPON_ID="$cid" COUNT="$COUNT" ./scripts/load/part-5/force_db_only.sh >/dev/null
-  curl -fsS -X POST "$BASE/admin/reconcile/run" >/dev/null
+  result="$(curl -fsS -X POST "$BASE/admin/reconcile/run")"
   check "발급자 명단 복구" "$(redis_cli SCARD "coupon:$cid:users")" "$COUNT"
-  check "자동 보정 횟수" "$(curl -fsS "$BASE/metrics/reconcile" | jq -r '.reconcileAutoFixTotal')" "1"
+  check "자동 보정 횟수" "$(jq -r '.autoFixed' <<< "$result")" "1"
 
   printf '\n\033[1;35m##### DB 측 불일치는 알람만 #####\033[0m\n'
   ./scripts/load/reset.sh >/dev/null
-  curl -fsS -X POST "$BASE/metrics/reconcile/reset" >/dev/null
   cid="$(./scripts/load/create_coupon.sh)"
   COUPON_ID="$cid" COUNT="$COUNT" ./scripts/load/part-5/force_dlt.sh >/dev/null
   stock_before="$(redis_cli GET "coupon:$cid:stock")"
-  curl -fsS -X POST "$BASE/admin/reconcile/run" >/dev/null
-  check "DB 측 불일치 감지" "$(curl -fsS "$BASE/metrics/reconcile" | jq -r '.redisDbDrift')" "$COUNT"
+  result="$(curl -fsS -X POST "$BASE/admin/reconcile/run")"
+  check "DB 측 불일치 감지" "$(jq -r '.redisDbDrift' <<< "$result")" "$COUNT"
   check "Redis 재고 유지" "$(redis_cli GET "coupon:$cid:stock")" "$stock_before"
   summary "part-5-2"
 }
@@ -83,7 +90,8 @@ source_stage() {
 }
 
 runtime_stage() {
-  if curl -fsS "$BASE/metrics/reconcile" >/dev/null 2>&1; then
+  reconcile_status="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/admin/reconcile/run")"
+  if [[ "$reconcile_status" == "405" ]]; then
     printf 'part-5-2'
   elif curl -fsS "$BASE/admin/issuance/dlt" >/dev/null 2>&1; then
     printf 'part-5-1'

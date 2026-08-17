@@ -103,6 +103,59 @@ DB 쓰기는 응답 경로에서 빠져 있다. 그래서 사용자 응답 p99 �
 그래서 검증의 `count_match` 가 **Redis 와 DB 의 교차 검증**으로 되살아났다
 ([`load-test-response.md` §16.5](load-test-response.md)).
 
+#### 이 열은 트랙마다 뜻이 반대다 (함정)
+
+정합성 트랙의 대사(`batch/CouponReconciler.kt`)는 같은 열을 **"DB 가 아는 발급 수"** 로 읽는다.
+
+```kotlin
+val dbDrift = coupon.totalQuantity - (coupon.issuedQuantity + stock)
+```
+
+그런데 위 파생(`issuedQuantity = totalQuantity − stock`)을 대입하면
+
+```
+dbDrift = total − (total − stock) − stock = 0
+```
+
+**동기화기가 도는 한 이 값은 구조적으로 항상 정확히 0 이다.** 재고가 음수이거나 총량을
+넘어 `coerceIn` 이 걸릴 때만 예외다. 즉 대사의 "DB 측 불일치 감지" 가 원리적으로
+아무것도 못 잡는다 — 코드는 멀쩡해 보이고 로그도 안 남으므로 알아채기 어렵다.
+
+**그래서 지우는 게 아니라 검증 동안만 끈다.** 동기화 주기를 property 로 뺐다
+(`coupon.sync.interval-ms` / `COUPON_SYNC_INTERVAL_MS`, 기본 1000).
+`scripts/consistency/windows/run-v2.ps1` 이 part-5-2 에서 `COUPON_RECONCILE_INTERVAL_MS` 와
+함께 `3600000` 으로 준다.
+
+지우면 안 되는 이유는 위 문단 그대로다 — `CouponRepository.incrementIssueQuantity` 는
+호출자가 없으므로(그 파일 주석이 직접 밝혀 둔다) 동기화기가 이 열의 **유일한** 기록자다.
+없애면 `issued_quantity` 가 영원히 0 이 되어 정확성 트랙의 `count_match` 가 영구 FAIL 이 된다.
+
+**`issued_quantity` 를 근거로 뭔가 판정하기 전에 그 시점의 동기화 주기가 얼마인지 먼저 본다.**
+
+#### 주기 대사가 창을 놓치지 않게 하는 것 (워터마크)
+
+`Reconciler.scheduledRecent` 는 `coupon:reconcile:recent` ZSET 을 시각 창으로 훑는다.
+
+```
+cutoff = now - grace
+창     = [cutoff - interval*2, cutoff]
+```
+
+`interval` 두 칸으로 겹치게 잡는 것은 **한 회차에서 실패한 쿠폰이 다음 회차에 다시 걸리게**
+하기 위해서다. 그런데 이 고정 창은 "스케줄러가 제때 돌았다" 를 전제한다 — 앱이 내려가 있었거나
+실행이 밀리면 그 사이 발급은 창을 지나쳐 버리고 **다시는 대사되지 않는다.**
+
+그래서 지난 회차의 상한을 `coupon:reconcile:watermark` 에 남기고, 다음 회차는
+
+```kotlin
+fromMs = minOf(slidingFromMs, watermarkMs ?: slidingFromMs)
+```
+
+로 시작한다. **창을 넓히기만 하고 좁히지는 않으므로** 위의 재시도 성질은 그대로다.
+워터마크는 훑기가 끝난 뒤에만 전진한다 — 도중에 터지면 다음 회차가 같은 구간을 다시 본다.
+
+`auditAll()`(관리자 수동, `POST /admin/reconcile/run`)은 여전히 전체 쿠폰을 훑는 백스톱이다.
+
 예외는 전부 `support/DomainException.kt` 의 sealed 계층이고,
 `support/GlobalExceptionHandler.kt` 가 RFC 9457 ProblemDetail 로 변환한다.
 `code` 프로퍼티에 `SOLD_OUT`, `ALREADY_ISSUED` 같은 식별자가 실린다.
@@ -135,8 +188,16 @@ src/main/kotlin/com/example/coupon/
                                   미스일 때만 Redis 플래그를 본다. 카운터 2종을 여기서 올린다
     CouponIssuer.kt             발급 자격 판정. Redis 접근은 IssuanceRedisRepository 에 위임한다
                                   (tryIssue / initStock / remainingStock)
-    IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 1초마다 반영
+    IssuedQuantitySynchronizer.kt  issued_quantity 를 Redis 에서 파생시켜 반영 (주기는
+                                  coupon.sync.interval-ms). 정합성 트랙과 충돌하니 §2 함정 참고
     IssuanceService.kt          사용/조회
+  batch/
+    Reconciler.kt               대사 진입점. scheduledRecent() 는 coupon:reconcile:recent ZSET 을
+                                  창으로 훑고, auditAll() 은 전체 쿠폰을 훑는다 (관리자 수동)
+                                  워터마크로 밀린 구간을 이어 본다 — 아래 참고
+    CouponReconciler.kt         쿠폰 한 장의 판정. DB 측이 어긋나면 알람만 내고 early return,
+                                  Redis 명단 누락만 자동 보정한다
+    ReconcileReport.kt          한 회차 집계 (autoFixed / driftAlerts / redisDbDrift)
   infrastructure/messaging/
     IssuanceTopics.kt           토픽·컨슈머그룹 이름 상수
     IssuanceRequested.kt        발행되는 이벤트 (couponId, userId, 발급/만료 시각)
@@ -199,7 +260,7 @@ src/main/resources/
 | 컬럼 | 역할 |
 |---|---|
 | `total_quantity` | 재고 총량. 부하 테스트에서 5,000 |
-| `issued_quantity` | 발급 카운터. **파생 값** — 1초마다 Redis 재고에서 계산해 덮어쓴다 |
+| `issued_quantity` | 발급 카운터. **파생 값** — 1초마다 Redis 재고에서 계산해 덮어쓴다. 정합성 트랙은 이 열을 반대 뜻으로 읽으므로 §2 의 함정을 볼 것 |
 | `starts_at` | null 이면 즉시 발급 가능. 부하 테스트는 null |
 | `validity_days` | 발급 시 만료일 계산용 |
 

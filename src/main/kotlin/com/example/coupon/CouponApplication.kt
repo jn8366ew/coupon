@@ -8,6 +8,7 @@ import org.springframework.scheduling.annotation.EnableScheduling
 
 @SpringBootApplication
 @ConfigurationPropertiesScan
+@EnableScheduling
 class CouponApplication
 
 fun main(args: Array<String>) {

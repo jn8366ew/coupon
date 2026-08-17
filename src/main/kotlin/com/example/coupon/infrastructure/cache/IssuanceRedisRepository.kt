@@ -14,8 +14,15 @@ class IssuanceRedisRepository (
     fun tryIssue(couponId: Long, userId: Long): Long =
         redis.runForLong(
             issueScript,
-            listOf(stockKey(couponId), usersKey(couponId), soldOutKey(couponId)),
+            listOf(
+                "coupon:$couponId:stock",
+                "coupon:$couponId:users",
+                "coupon:$couponId:sold_out",
+                "coupon:reconcile:recent"
+            ),
             userId, soldOutProperties.ttlSeconds,
+            System.currentTimeMillis(),
+            couponId,
         )
 
     fun initStock(couponId: Long, totalQuantity: Int){

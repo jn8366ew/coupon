@@ -100,12 +100,19 @@ services:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       # stamped 데모 기본값은 1초. 셀에서 COUPON_CACHE_TTL_MS=10000으로 오버라이드 가능함
       COUPON_CACHE_TTL_MS: ${COUPON_CACHE_TTL_MS:-1000}
+      # issue 쿠폰 정보 조회의 seamped 차이를 보이기 위한 DB latency 시뮬레이션
       COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS: ${COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS:-100}
       COUPON_CACHE_FRESH_MS: ${COUPON_CACHE_FRESH_MS:-500}
+      # 대사 추가, 기본 1분. 검증 스크립트는 수동 트리거와 겹치지 않게 크게 오버라이드
+      COUPON_RECONCILE_INTERVAL_MS: ${COUPON_RECONCILE_INTERVAL_MS:-60000}
+      # 대사가 훑는 발급 시각 창의 상한 여유분. 주기 대사 검증에서는 짧게 줘서
+      # 방금 낸 발급이 바로 창에 들어오게 한다
+      COUPON_RECONCILE_GRACE_PERIOD_MS: ${COUPON_RECONCILE_GRACE_PERIOD_MS:-10000}
+      # issued_quantity write-behind 주기. part-5 대사 검증 때만 크게 줘서 사실상 끈다
+      # (켜져 있으면 issued_quantity 가 Redis 재고에서 파생돼 DB 측 드리프트가 항상 0)
+      COUPON_SYNC_INTERVAL_MS: ${COUPON_SYNC_INTERVAL_MS:-1000}
     ports:
       - "8080:8080"
-
-
 
 volumes:
   mysql-data:

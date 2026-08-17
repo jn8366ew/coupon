@@ -10,6 +10,8 @@ Spring Boot 4.1 / Kotlin / MySQL / Redis, 부하 테스트는 k6.
 효율 [`docs/load-test-efficiency.md`](docs/load-test-efficiency.md) §18–§22.
 **절 번호는 세 파일에 걸쳐 이어진다.**
 거기서 얻은 것을 개념으로 정리한 것은 [`docs/learning-notes.md`](docs/learning-notes.md).
+정합성(대사) 트랙은 숫자를 안 재고 PASS/FAIL 만 내므로 절 번호 밖에 따로 있다 —
+[`docs/consistency-track.md`](docs/consistency-track.md) (검증 항목 + 밟은 함정 + 증상별 의심 순서).
 
 ## 규칙
 

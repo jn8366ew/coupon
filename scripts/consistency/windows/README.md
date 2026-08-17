@@ -11,17 +11,60 @@
 |---|---|---|
 | part-5-0 | 두 방향의 불일치를 주입하고 drift 리포트를 본다 | 눈으로 본다 |
 | part-5-1 | DLT 에 쌓인 메시지를 replay 해 DB 에 되살린다 | PASS/FAIL |
-| part-5-2 | 대사(reconcile)가 Redis 누락은 자동 보정, DB 측은 알람만 내는지 | PASS/FAIL |
+| part-5-2 | 발급 → 대사 대상 등록, Redis 누락은 자동 보정, DB 측은 알람만 내는지 | PASS/FAIL |
+
+`run-v2.ps1` 의 part-5-2 에는 **원본에 없는 블록 ④⑤**가 붙어 있다.
+①②③ 은 전부 `/admin/reconcile/run`(= `auditAll()`, 전체 쿠폰 `findAll`)이라
+실제 운용 경로인 `Reconciler.scheduledRecent` 를 한 번도 돌리지 않는다. 그래서 ZSET 등록이나
+창 계산(`cutoff = now - grace`, `from = cutoff - interval*2`)에 버그가 있어도 못 잡는다.
+
+- **④ 주기 대사가 스스로 보정하는지** — 수동 트리거를 아예 부르지 않는다. 진짜 발급 API 를
+  태워 ZSET 에 올린 뒤 `SREM` 으로 명단만 날리고, 스케줄러가 되살리는지 기다린다.
+  `SREM` 직후 `SCARD=0` 을 확인하므로, 나중에 1 이 되면 그건 스케줄러가 한 것이다
+  (대사를 부르는 곳은 그 엔드포인트와 스케줄러뿐이다).
+- **⑤ 워터마크** — `docker compose stop coupon-service` 로 **스케줄러를 진짜 멈춘 뒤**
+  발급을 주입하고, 슬라이딩 창 폭보다 오래 묵힌 다음 다시 띄운다. 워터마크가 없으면
+  그 발급은 창을 지나쳐 영영 대사되지 않는다. 앱을 내렸다 올리므로 이 블록만 1분 가까이 걸린다.
+  통과 여부보다 **주입이 실제로 창 밖이었는지**(`${ageMs}ms > ${windowMs}ms`)를 같이 찍는 것이
+  중요하다 — 창 안이면 워터마크 없이도 통과하는 무의미한 검증이 되기 때문이다.
+
+블록마다 설정이 다르다.
+
+| | ①②③ | ④ | ⑤ |
+|---|---|---|---|
+| `COUPON_RECONCILE_INTERVAL_MS` | `3600000` (끔) | `5000` | `5000` |
+| `COUPON_RECONCILE_GRACE_PERIOD_MS` | 기본 | `500` | `500` |
+| `COUPON_SYNC_INTERVAL_MS` | `3600000` (끔) | `1000` (**켬**) | `3600000` (끔) |
+
+④에서만 동기화기를 켜는 이유 — 거기서는 발급 API 를 태우므로 `issued_quantity` 를 맞춰 줄
+주체가 동기화기뿐이다. 꺼 두면 0 으로 남아 `dbDrift != 0` 이 되고, 대사가 알람만 내고
+early return 해서(`CouponReconciler.kt:32-34`) 명단을 안 고친다. ③과 정반대의 필요다.
+⑤는 `force-db-only.ps1` 이 `issued_quantity` 를 직접 맞춰 주므로 꺼 둔다.
 
 **절 번호는 아직 문서에 없다.** 측정 트랙이 아니라 `docs/load-test-*.md` 에 들어가지 않는다.
 
 ## 실행 (프로젝트 루트에서)
 
 ```powershell
-.\scripts\consistency\windows\run.ps1              # 단계 자동 감지
-.\scripts\consistency\windows\run.ps1 -Count 3     # 주입 건수 (기본 10)
-.\scripts\consistency\windows\run.ps1 -Stage part-5-0   # 감지 무시하고 강제
+.\scripts\consistency\windows\run-v2.ps1              # 단계 자동 감지
+.\scripts\consistency\windows\run-v2.ps1 -Count 3     # 주입 건수 (기본 10)
+.\scripts\consistency\windows\run-v2.ps1 -Stage part-5-0   # 감지 무시하고 강제
 ```
+
+**`run-v2.ps1` 이 현재 판본이다.** 강의의 `run.sh` 가 개정되면서 세 가지가 바뀌었고,
+그것을 새 파일로 옮겼다. `run.ps1` 은 개정 전 판본이라 그대로 남겨 둔다.
+
+| | `run.ps1` (개정 전) | `run-v2.ps1` (현재) |
+|---|---|---|
+| 대사 결과 | `GET /metrics/reconcile` 의 누적 카운터 | `POST /admin/reconcile/run` 의 **응답** |
+| 리셋 | `POST /metrics/reconcile/reset` | 없음 (한 번의 실행 결과라 리셋할 게 없다) |
+| 런타임 감지 | `GET /metrics/reconcile` 이 200 인가 | `GET /admin/reconcile/run` 이 **405** 인가 |
+
+405 를 보는 것이 요점이다. 이 엔드포인트는 POST 전용이라 GET 하면 405 가 오고,
+**그 405 자체가 라우트가 있다는 증거**다. 게다가 이 라우트는 `Reconciler.kt` 와 같은 시점에
+생기므로 소스 감지와 런타임 감지가 같이 참이 된다 — 개정 전에는 `/metrics/reconcile` 을
+따로 만들기 전까지 둘이 계속 어긋나서 "이미지를 안 만들었다" 는 틀린 안내가 나왔다.
+`/metrics/reconcile` 은 이제 앱에 만들 필요가 없다.
 
 앱이 안 떠 있으면 먼저 띄운다. **이 러너는 빌드하지 않는다** (CLAUDE.md — 태그 선택은 사람 몫).
 
@@ -118,16 +161,30 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh `
   --bootstrap-server localhost:9092 --topic issuance.requested.DLT --from-beginning --timeout-ms 5000
 ```
 
-**`COUPON_RECONCILE_INTERVAL_MS` / `COUPON_RECONCILE_AUDIT_CRON` 은 지금 컨테이너에 안 붙는다.**
-`docker-compose.yml` 의 `coupon-service.environment` 에 선언이 없는 이름은 셸 환경변수로 줘도
-compose 가 전달하지 않는다. part-5-2 에 들어갈 때 두 줄을 추가해야 한다.
+**`docker-compose.yml` 의 `coupon-service.environment` 에 선언이 없는 이름은 셸 환경변수로 줘도
+compose 가 전달하지 않는다.** part-5-2 에 필요한 두 줄은 이미 추가돼 있다.
 
 ```yaml
-      COUPON_RECONCILE_INTERVAL_MS: ${COUPON_RECONCILE_INTERVAL_MS:-}
-      COUPON_RECONCILE_AUDIT_CRON: ${COUPON_RECONCILE_AUDIT_CRON:-}
+      COUPON_RECONCILE_INTERVAL_MS: ${COUPON_RECONCILE_INTERVAL_MS:-60000}
+      COUPON_SYNC_INTERVAL_MS: ${COUPON_SYNC_INTERVAL_MS:-1000}
 ```
 
-`run.ps1` 은 재기동 후 실제로 붙었는지 `docker inspect` 로 보고, 없으면 위 안내를 찍는다
+`run-v2.ps1` 이 part-5-2 에서 **둘 다 `3600000`(1시간)** 으로 주고 앱을 재생성한다.
+스케줄러 두 개를 사실상 꺼 두는 것이다.
+
+- **대사(`Reconciler`)** — 안 꺼지면 검증 도중 끼어들어 `/admin/reconcile/run` 의 결과인지
+  알 수 없게 된다.
+- **발급 수 동기화(`IssuedQuantitySynchronizer`)** — 이쪽이 더 미묘하다. 이 동기화기는
+  `issued_quantity` 를 Redis 재고에서 파생시킨다 (`issued = total - stock`). 그러면 대사의
+  DB 측 드리프트가 `total - (issued + stock) = 0` 으로 **구조적으로 항상 0** 이 되어
+  `DB 측 불일치 감지` 가 원리적으로 통과할 수 없다. `force-dlt` 는 "DB 는 발급을 모르는데
+  Redis 만 줄어든" 상태를 만드는 것이므로 그동안 `issued_quantity` 가 0 으로 남아야 한다.
+
+  꺼야 하는 것이지 지울 것은 아니다. 이 파생은 정확성 트랙에서 `count_match` 를
+  "Redis 가 센 수 vs DB 실제 행 수" 교차 검증으로 만드는 장치다 (`verify.ps1` 의
+  `IF(issued_quantity = issuance_rows, ...)`). 지우면 그 판정이 영구 FAIL 이 된다.
+
+`run-v2.ps1` 은 재기동 후 실제로 붙었는지 `docker inspect` 로 보고, 없으면 위 안내를 찍는다
 (멈추지는 않는다). "설정을 바꿨으면 적용됐는지 먼저 확인한다" 는 이 저장소의 원칙이다
 — `docs/architecture.md` §7.
 
@@ -151,7 +208,8 @@ Windows 판에만 반영되어 있다.
 
 | 파일 | 원본 | 하는 일 |
 |---|---|---|
-| `run.ps1` | `run.sh` + `_common.sh` | 단계 감지 → 시나리오 실행 → 검증 |
+| `run-v2.ps1` | **개정된** `run.sh` + `_common.sh` | 단계 감지 → 시나리오 실행 → 검증 |
+| `run.ps1` | 개정 **전** `run.sh` + `_common.sh` | 위와 같음 (옛 판본, 보존용) |
 | `reset.ps1` | `scripts/concurrency/load/reset.sh` | `coupon`/`issuance`(+있으면 `issuance_dlt_log`) TRUNCATE + `FLUSHDB` |
 | `create-coupon.ps1` | (`scripts/load/create_coupon.sh`) | 재고 5000 쿠폰 1개 생성, ID 반환 |
 | `drift-report.ps1` | `drift_report.sh` | 지금 얼마나 어긋났는지 출력 |
