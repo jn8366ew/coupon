@@ -4,6 +4,7 @@
 Spring Boot 4.1 / Kotlin / MySQL / Redis, 부하 테스트는 k6.
 
 **구조·함정·측정 하네스는 [`docs/architecture.md`](docs/architecture.md) 를 먼저 읽을 것.**
+흐름을 그림으로 보려면 [`docs/flow-diagrams.md`](docs/flow-diagrams.md) (SVG 3장 + 정합성·가용성 요약).
 측정 결과와 해석은 트랙별로 세 파일 — 정확성 [`docs/load-test-k6.md`](docs/load-test-k6.md) §1–§12,
 응답시간 [`docs/load-test-response.md`](docs/load-test-response.md) §13–§17,
 효율 [`docs/load-test-efficiency.md`](docs/load-test-efficiency.md) §18–§22.

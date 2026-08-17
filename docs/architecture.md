@@ -36,6 +36,8 @@
 
 ## 2. 요청 흐름
 
+**그림으로 먼저 보려면 [`flow-diagrams.md`](flow-diagrams.md).** 아래 트리와 같은 내용이다.
+
 측정 대상은 `POST /api/v1/coupons/{couponId}/issue` 하나다. 나머지 엔드포인트는 준비·확인용이다.
 
 | 엔드포인트 | 파일 | 용도 |
