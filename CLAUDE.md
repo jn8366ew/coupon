@@ -38,7 +38,10 @@ Spring Boot 4.1 / Kotlin / MySQL / Redis, 부하 테스트는 k6.
   - 정확성: `.\scripts\concurrency\windows\load-test.ps1 <over_issuance|duplicate_issuance>`
   - 응답시간: `.\scripts\response\windows\run.ps1` (워밍업 1회 + 본 측정 1회)
   - 효율: `.\scripts\efficiency\windows\run.ps1` (`-Scenario policy|sellout`, 워밍업 1회 + 본 측정 1회)
-  - 가용성(대기실): `.\scripts\availability\windows\run.ps1 [baseline|single|scale|verify|journey]`
-    (인자 없으면 소스 단계 자동 감지. 부하 조건이 다른 트랙과 다르다 — 1,000/s × 20s, 재고 100만)
+  - 가용성(대기실): `.\scripts\availability\windows\run.ps1 [baseline|single|scale|verify|journey|gateway]`
+    (인자 없으면 소스 단계 자동 감지. 부하 조건이 다른 트랙과 다르다 — 1,000/s × 20s, 재고 100만.
+    `gateway` 만 또 다르다 — 어뷰저 200/s + 정상 20/s × 10s, 오차 ±20%, 게이트웨이 8090 경유.
+    같은 트랙 안에서도 나란히 비교하면 안 된다. `coupon-gateway:latest` 이미지가 있어야 돈다:
+    `.\gradlew.bat :gateway:jibBuildTar` → `docker load -i gateway\build\jib-image.tar`)
 - k6 결과에서 `checks` 가 100% 가 아니면 나머지 숫자는 읽지 않는다. 특히 `connected (not status 0)`.
   응답시간·효율 트랙은 `status 0` 을 지연 분포에서 빼므로 `status_conn_error` 를 같이 읽는다.

@@ -120,6 +120,8 @@ services:
       COUPON_WAITING_ROOM_ADMIT_PER_SECOND: ${COUPON_WAITING_ROOM_ADMIT_PER_SECOND:-100}
       COUPON_WAITING_ROOM_PASS_TTL_MS: ${COUPON_WAITING_ROOM_PASS_TTL_MS:-30000}
     ports:
+      # 측정 스크립트가 직접 붙는 포트. 운영이라면 publish 하지 않고
+      # Gateway 내부망(coupon-service:8080)으로만 연결한다.
       - "8080:8080"
 
   # 통과 속도 유지 확인용 2번째 인스턴스. `docker compose --profile scale up -d` 로만 띄운다.
@@ -128,6 +130,38 @@ services:
     profiles: [ "scale" ]
     ports:
       - "127.0.0.1:8081:8080"
+
+  # API 관문(Spring Cloud Gateway). 어뷰저를 대기실 진입과 발급 앞에서 사용자별로 컷.
+  # 측정 트랙 5개는 8080 의 coupon-service 에 직접 붙으므로 이 서비스를 거치지 않는다.
+  #
+  # profile 을 붙인 것은 강의 원본과 다른 점이다. 두 가지 이유:
+  #   1. build-and-run.ps1 이 `docker compose up -d` 를 인자 없이 부른다. profile 이 없으면
+  #      coupon-gateway 이미지가 없을 때 pull 을 시도하다 실패해서 기동 전체가 죽는다.
+  #   2. 1,000/s 를 때리는 가용성 트랙 옆에서 게이트웨이가 같은 박스의 CPU 를 쓰면
+  #      기존 기준선과의 비교가 흔들린다. 뜨는 시점을 명시한다.
+  # 쓸 때: docker compose --profile gateway up -d
+  #
+  # 이미지 빌드(jibDockerBuild 는 교착에 빠진다 — docs/jib-docker-build-troubleshooting.md):
+  #   .\gradlew.bat :gateway:jibBuildTar
+  #   docker load -i gateway\build\jib-image.tar
+  gateway:
+    image: coupon-gateway:latest
+    profiles: ["gateway"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      coupon-service:
+        condition: service_started
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      COUPON_SERVICE_URI: http://coupon-service:8080
+      # 한 사용자는 초당 5번, 순간 최대 10번까지. 셸에서 오버라이드 가능.
+      # .env 에 넣으면 안 된다 — build-and-run.ps1 이 .env 를 통째로 덮어쓴다.
+      RATE_LIMIT_REPLENISH: ${RATE_LIMIT_REPLENISH:-5}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-10}
+    ports:
+      - "8090:8080"
 
 volumes:
   mysql-data:

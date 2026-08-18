@@ -1,11 +1,12 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    가용성(대기실) 트랙 러너. baseline / single / scale / verify / journey.
+    가용성(대기실) 트랙 러너. baseline / single / scale / verify / journey / gateway.
 
 .DESCRIPTION
     scripts/availability/run.sh 의 Windows 판본. 부하 조건(rate, duration, 재고, 허용 오차)은
-    bash 원본과 같다.
+    bash 원본과 같다. gateway 모드만 원본이 별도 스크립트다
+    (scripts/availability/gateway_rate_limit.sh) — 여기서는 모드로 합쳤다.
 
     모드
       baseline  대기실 없이 발급 API 로 직접 쏟아붓는다. 대기실 도입 전후를 비교하는 대조군.
@@ -13,7 +14,13 @@
       scale     서버 2대(coupon-service-2, --profile scale). 통과 속도가 서버 수와 무관한지 본다.
       verify    숫자 대신 기능 정오만 PASS/FAIL 로 (verify.ps1 위임).
       journey   진입 -> 폴링 -> 발급까지 실제 클라이언트 여정. 폴링이 만드는 추가 요청량을 본다.
-      (인자 없이 실행하면 소스에 대기실 구현이 있으면 single, 없으면 baseline 이다.)
+      gateway   게이트웨이(8090)로 어뷰저 1명과 정상 사용자를 동시에 보낸다. 어뷰저만 429 로
+                컷되고 정상 사용자는 안 막히는지 본다. --profile gateway 로 띄웠다 내린다.
+      (인자 없이 실행하면 소스에 대기실 구현이 있으면 single, 없으면 baseline 이다.
+       gateway 는 자동 감지에 들어가지 않는다 — 명시해야 돈다.)
+
+    gateway 모드는 부하 조건이 다르다 — 어뷰저 200/s + 정상 20/s x 10초, 허용 오차 20%.
+    다른 모드(1,000/s x 20초, 오차 30%)와 나란히 놓고 읽으면 안 되므로 파라미터도 따로 둔다.
 
     원본과 다른 점 — 그대로 옮기면 조용히 틀리는 자리들
       - 게이트 경로가 com/apiece/... 가 아니라 com/example/... 다 (이 저장소의 패키지).
@@ -39,11 +46,15 @@
 .EXAMPLE
     .\scripts\availability\windows\run.ps1 journey -Users 200
     진입 -> 폴링 -> 발급 여정.
+
+.EXAMPLE
+    .\scripts\availability\windows\run.ps1 gateway
+    게이트웨이 rate limit. 어뷰저가 토큰 한도만큼만 통과하는지 본다.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('auto', 'baseline', 'single', 'scale', 'verify', 'journey')]
+    [ValidateSet('auto', 'baseline', 'single', 'scale', 'verify', 'journey', 'gateway')]
     [string]$Mode = 'auto',
 
     [int]$Rate = 1000,
@@ -59,6 +70,18 @@ param(
     # journey 전용
     [int]$Users = 200,
 
+    # gateway 전용. $Duration(20s) 과 $TolerancePercent(30) 를 재사용하지 않는 것이 요점이다 —
+    # 그 둘은 대기실 판정의 기준값이라, 공유하면 한쪽을 만지는 순간 다른 트랙의 조건이 조용히 바뀐다.
+    # 값은 bash 원본(gateway_rate_limit.sh)과 같다.
+    [int]$AbuserRate = 200,
+    [int]$NormalRate = 20,
+    [string]$GatewayDuration = '10s',
+    [int]$GatewayTolerancePercent = 20,
+    # 게이트웨이 컨테이너에 RATE_LIMIT_* 가 붙어 있으면 그 값이 이긴다 (아래에서 덮어쓴다).
+    # 여기 값은 환경변수가 없을 때의 fallback 이다 (gateway/application.yaml 기본값과 같다).
+    [int]$RateLimitReplenish = 5,
+    [int]$RateLimitBurst = 10,
+
     [switch]$KeepLogging
 )
 
@@ -72,6 +95,7 @@ Set-Location -LiteralPath (Join-Path $PSScriptRoot '..\..\..')
 # Docker Desktop 의 그 경로가 응답 없이 멈추는 경우가 있다 (IPv4 로 폴백하지도 못한다).
 $AppUrl = 'http://127.0.0.1:8080'
 $SecondaryUrl = 'http://127.0.0.1:8081'
+$GatewayUrl = 'http://127.0.0.1:8090'
 
 # compose 호출을 전부 같은 파일 조합으로 통일한다.
 # 호출마다 -f 조합이 다르면 compose 가 보는 "원하는 설정" 과 실제 떠 있는 컨테이너의 설정이
@@ -133,6 +157,15 @@ function Get-SourceStage {
         return 'part-6-1'
     }
     return 'part-6-0'
+}
+
+# 게이트웨이는 Get-SourceStage 에 단계를 더하지 않고 따로 본다.
+# 여기에 'part-6-2' 를 얹으면 아래 `$sourceStage -ne 'part-6-1'` 검사가 참이 되어
+# single / scale / journey 가 전부 막힌다 — 게이트웨이를 추가한 순간 기존 모드가 죽는다.
+#
+# 게이트웨이 모듈만 com/apiece 다 (강의 원본 패키지 그대로 받았다). 앱은 com/example 이다.
+function Test-GatewaySource {
+    return (Test-Path -LiteralPath 'gateway/src/main/kotlin/com/apiece/gateway/GatewayApplication.kt')
 }
 
 function Invoke-K6 {
@@ -221,6 +254,69 @@ function Stop-SecondInstance {
     }
 }
 
+# 게이트웨이를 내린다. compose 에 profiles: ["gateway"] 가 붙어 있으므로 평소에는 안 뜨고,
+# 이 모드가 띄웠으면 이 모드가 내린다. 남겨 두면 다음 라운드(1,000/s)의 옆에서 CPU 를 쓴다.
+# $ErrorActionPreference 를 잠깐 내리는 이유는 Stop-SecondInstance 와 같다.
+function Stop-Gateway {
+    param([switch]$Announce)
+
+    if ($Announce) {
+        Write-Host ""
+        Write-Host "==> 게이트웨이 정리 (gateway)" -ForegroundColor Cyan
+    }
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        docker @Compose --profile gateway stop gateway 2>&1 | Out-Null
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
+# 게이트웨이 준비 확인. 단순한 up/down 이 아니라 세 갈래로 나눈다.
+#
+#   ready        200 — 라우트가 이 저장소 경로(/api/v1/...)로 맞춰져 있다
+#   stale-routes 404 — 프로세스는 떴는데 predicate 가 강의 원본 경로다.
+#                      그 이미지로 재면 발급 경로가 게이트웨이를 안 거치는데, k6 은
+#                      /api/waiting-room 만 때리므로 PASS 가 찍힌다. 여기서 끊어야 한다.
+#   timeout      아예 응답이 없다
+#
+# 부팅 중에는 연결 자체가 거절되지 404 가 나오지 않는다. 그래도 경계를 여유 있게 보려고
+# 404 가 연속 3번 나올 때만 stale 로 판정한다.
+function Wait-GatewayReady {
+    param([int]$TimeoutSeconds = 60)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $notFoundStreak = 0
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-WebRequest -Uri "$GatewayUrl/api/v1/users/me/issuances" `
+                -Headers @{ 'X-User-Id' = '1' } -UseBasicParsing -TimeoutSec 5 | Out-Null
+            return 'ready'
+        }
+        catch {
+            $status = $null
+            if ($_.Exception.Response) { $status = $_.Exception.Response.StatusCode.value__ }
+
+            if ($status -eq 404) {
+                $notFoundStreak++
+                if ($notFoundStreak -ge 3) { return 'stale-routes' }
+            }
+            else {
+                $notFoundStreak = 0
+            }
+
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    if ($notFoundStreak -gt 0) { return 'stale-routes' }
+    return 'timeout'
+}
+
 # ---------------------------------------------------------------------------
 # 모드 결정 — 소스에 구현이 있는지부터 본다 (원본 run.sh 의 source_stage / require_source)
 # ---------------------------------------------------------------------------
@@ -234,6 +330,13 @@ if ($Mode -eq 'auto') {
 if ($Mode -ne 'baseline' -and $sourceStage -ne 'part-6-1') {
     Write-Host "!! $Mode 은 part-6-1-waiting-room 이후에 실행할 수 있습니다." -ForegroundColor Red
     Write-Host "   src/main/kotlin/com/example/coupon/application/RedisWaitingRoom.kt 가 없습니다." -ForegroundColor DarkGray
+    exit 1
+}
+
+# gateway 는 대기실(위 검사)에 더해 게이트웨이 모듈까지 필요하다.
+if ($Mode -eq 'gateway' -and -not (Test-GatewaySource)) {
+    Write-Host "!! gateway 는 part-6-2-edge-rate-limit 이후에 실행할 수 있습니다." -ForegroundColor Red
+    Write-Host "   gateway/src/main/kotlin/com/apiece/gateway/GatewayApplication.kt 가 없습니다." -ForegroundColor DarkGray
     exit 1
 }
 
@@ -277,12 +380,24 @@ if (-not $KeepLogging -and ($containerEnv -match 'SPRING_JPA_SHOW_SQL=false').Co
 
 # 통과 속도와 입장권 TTL 은 이 트랙 판정의 기준값이다. 파라미터 기본값을 믿지 않고
 # 실제로 컨테이너에 붙은 값을 읽어 쓴다 (붙어 있지 않으면 파라미터 값이 곧 yaml 기본값이다).
+# docker inspect 가 뱉은 Config.Env 줄 목록에서 값 하나를 꺼낸다.
+# 컨테이너를 인자로 받는 형태가 따로 필요하다 — gateway 모드는 coupon-service 가 아니라
+# 게이트웨이 컨테이너의 RATE_LIMIT_* 를 읽어야 하기 때문이다.
+function Get-EnvValueFrom {
+    param(
+        [string[]]$Lines,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $line = @($Lines) | Where-Object { $_ -like "$Name=*" } | Select-Object -First 1
+    if ($line) { return ($line -split '=', 2)[1] }
+    return $null
+}
+
 function Get-ContainerEnvValue {
     param([Parameter(Mandatory)][string]$Name)
 
-    $line = @($containerEnv) | Where-Object { $_ -like "$Name=*" } | Select-Object -First 1
-    if ($line) { return ($line -split '=', 2)[1] }
-    return $null
+    return Get-EnvValueFrom -Lines $containerEnv -Name $Name
 }
 
 $admitFromEnv = Get-ContainerEnvValue 'COUPON_WAITING_ROOM_ADMIT_PER_SECOND'
@@ -350,8 +465,11 @@ if ($Mode -eq 'baseline') {
         Write-Host "       docker images coupon-service                     # 태그 목록" -ForegroundColor Yellow
         Write-Host "       .\build-and-run.ps1 -Tag reconcile-v3 -NoBuild" -ForegroundColor Yellow
         Write-Host ""
-        Write-Host "   끝나면 되돌립니다:" -ForegroundColor DarkGray
-        Write-Host "       .\build-and-run.ps1 -Tag waiting-room -NoBuild" -ForegroundColor Yellow
+        # 되돌릴 태그를 하드코딩하지 않는다. 새 구현이 나올 때마다 이 문자열이 낡고,
+        # 낡은 줄을 그대로 따라 하면 한 단계 전 이미지로 돌아가게 된다 (실제로 그랬다).
+        # 지금 떠 있는 것이 곧 돌아올 곳이므로 그 값을 그대로 찍는다.
+        Write-Host "   끝나면 지금 이 이미지로 되돌립니다:" -ForegroundColor DarkGray
+        Write-Host "       .\build-and-run.ps1 -Tag $imageTag -NoBuild" -ForegroundColor Yellow
         exit 1
     }
     Write-Host "대기실 없음 확인됨 (대조군으로 성립)" -ForegroundColor DarkGray
@@ -637,6 +755,196 @@ function Invoke-JourneyMode {
 
 }
 
+function Invoke-GatewayMode {
+    # 원본 gateway_rate_limit.sh 의 두 가드. 리셋보다 앞이라 DB/Redis 는 아직 안 건드렸다.
+    if ($GatewayDuration -notmatch '^[1-9][0-9]*s$') {
+        Write-Host "!! GatewayDuration 은 10s 처럼 초 단위로 입력해야 합니다 (지금: $GatewayDuration)." -ForegroundColor Red
+        exit 1
+    }
+    $seconds = [int]$GatewayDuration.Substring(0, $GatewayDuration.Length - 1)
+
+    if ($AbuserRate -le $RateLimitReplenish) {
+        Write-Host "!! AbuserRate 는 replenish rate($RateLimitReplenish/s)보다 커야 제한을 검증할 수 있습니다 (지금: $AbuserRate)." -ForegroundColor Red
+        exit 1
+    }
+
+    try {
+        # --no-deps: gateway 에는 depends_on redis / coupon-service 가 걸려 있다. 그대로 두면
+        # compose 가 의존 서비스까지 다루면서, 위에서 확인해 둔 앱 컨테이너를 재생성할 여지가 생긴다.
+        #
+        # Invoke-Step 을 쓰지 않는다 — 실패하면 종료 코드를 그대로 흘리는 대신
+        # "이미지가 없다" 를 안내해야 하는 자리다.
+        Write-Host ""
+        Write-Host "==> 게이트웨이 기동 (gateway, profile gateway)" -ForegroundColor Cyan
+        docker @Compose --profile gateway up -d --no-deps gateway
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host ""
+            Write-Host "!! 게이트웨이를 띄우지 못했습니다. coupon-gateway:latest 이미지가 없는 경우가 대부분입니다." -ForegroundColor Red
+            Write-Host "   러너는 빌드하지 않습니다 (CLAUDE.md). 먼저 이미지를 만드세요:" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "       .\gradlew.bat :gateway:jibBuildTar" -ForegroundColor Yellow
+            Write-Host "       docker load -i gateway\build\jib-image.tar" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "   (jibDockerBuild 는 교착에 빠집니다 — docs/jib-docker-build-troubleshooting.md)" -ForegroundColor DarkGray
+            exit 1
+        }
+
+        Write-Host ""
+        Write-Host "==> 게이트웨이 준비 대기 ($GatewayUrl)" -ForegroundColor Cyan
+        switch (Wait-GatewayReady) {
+            'ready' {
+                Write-Host "준비됨 (라우트가 /api/v1/... 로 맞춰져 있습니다)"
+            }
+            'stale-routes' {
+                Write-Host "!! 게이트웨이는 떠 있는데 /api/v1/users/me/issuances 가 404 입니다." -ForegroundColor Red
+                Write-Host "   지금 뜬 이미지의 라우트가 강의 원본 경로(/api/users/me/issuances)입니다." -ForegroundColor DarkGray
+                Write-Host "   이 상태로 재면 발급·사용·조회가 게이트웨이를 아예 안 거치는데," -ForegroundColor DarkGray
+                Write-Host "   k6 은 /api/waiting-room 만 때리므로 PASS 가 찍힙니다 — 조용히 틀린 측정입니다." -ForegroundColor DarkGray
+                Write-Host ""
+                Write-Host "   gateway/src/main/resources/application.yaml 의 predicate 를 확인하고 다시 빌드하세요:" -ForegroundColor DarkGray
+                Write-Host "       .\gradlew.bat :gateway:jibBuildTar" -ForegroundColor Yellow
+                Write-Host "       docker load -i gateway\build\jib-image.tar" -ForegroundColor Yellow
+                exit 1
+            }
+            default {
+                Write-Host "!! 게이트웨이가 60초 안에 응답하지 않습니다 ($GatewayUrl)." -ForegroundColor Red
+                Write-Host "   docker compose logs gateway 로 확인하세요." -ForegroundColor DarkGray
+                exit 1
+            }
+        }
+
+        # 기대치 계산의 근거는 파라미터 기본값이 아니라 실제로 뜬 게이트웨이의 값이다.
+        # compose 가 다른 값으로 떠 있으면 abuser_passed 의 허용 구간이 통째로 틀린다
+        # (대기실 모드가 COUPON_WAITING_ROOM_* 를 컨테이너에서 읽는 것과 같은 이유).
+        # --profile 을 빼지 않는다. compose 의 ps 는 활성 profile 로 서비스를 거르므로,
+        # profile 이 붙은 서비스를 profile 없이 조회하면 떠 있어도 안 잡힐 수 있다.
+        $gatewayContainerId = (docker @Compose --profile gateway ps -q gateway | Select-Object -First 1)
+        if (-not $gatewayContainerId) {
+            Write-Host "!! gateway 컨테이너를 찾을 수 없습니다." -ForegroundColor Red
+            exit 1
+        }
+
+        $gatewayEnv = docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $gatewayContainerId
+        $replenishFromEnv = Get-EnvValueFrom -Lines $gatewayEnv -Name 'RATE_LIMIT_REPLENISH'
+        $burstFromEnv = Get-EnvValueFrom -Lines $gatewayEnv -Name 'RATE_LIMIT_BURST'
+        if ($replenishFromEnv) { $RateLimitReplenish = [int]$replenishFromEnv }
+        if ($burstFromEnv) { $RateLimitBurst = [int]$burstFromEnv }
+
+        $gatewayImage = docker inspect --format '{{.Config.Image}}' $gatewayContainerId
+        Write-Host "게이트웨이 이미지: $gatewayImage" -ForegroundColor Green
+        Write-Host "토큰 버킷 = 초당 ${RateLimitReplenish}개 채움, 순간 최대 ${RateLimitBurst}개" -ForegroundColor DarkGray
+
+        # 위 가드는 파라미터 기본값으로 봤다. 컨테이너 값이 더 크면 그 판단이 무효가 되므로
+        # 실제 값으로 한 번 더 본다 — 어뷰저가 한도를 못 넘으면 잴 것이 없다.
+        if ($AbuserRate -le $RateLimitReplenish) {
+            Write-Host "!! AbuserRate($AbuserRate) 가 게이트웨이의 replenish rate(${RateLimitReplenish}/s) 이하입니다." -ForegroundColor Red
+            Write-Host "   한도에 걸리지 않으므로 제한을 검증할 수 없습니다." -ForegroundColor DarkGray
+            exit 1
+        }
+
+        $script:SummaryName = "gateway_rate_limit-$imageTag.json"
+        $summaryName = $script:SummaryName
+
+        # 리셋이 FLUSHALL 이라 rate limiter 의 Redis 키까지 지운다. 준비 확인이 만든
+        # user:1 버킷이 여기서 정리되므로, 이 순서를 뒤집으면 첫 측정이 남은 토큰에 영향을 받는다.
+        & "$PSScriptRoot\reset.ps1"
+        $couponId = New-LoadCoupon
+
+        # k6 은 compose 네트워크 안에서 도므로 호스트 포트 8090 이 아니라 서비스 이름으로 붙는다.
+        Invoke-K6 -ScriptFile 'gateway_rate_limit.js' -SummaryName $summaryName -EnvVars @{
+            COUPON_ID         = $couponId
+            BASE_URL          = 'http://gateway:8080'
+            DURATION          = $GatewayDuration
+            ABUSER_RATE       = $AbuserRate
+            NORMAL_RATE       = $NormalRate
+            REPLENISH_RATE    = $RateLimitReplenish
+            BURST_CAPACITY    = $RateLimitBurst
+            TOLERANCE_PERCENT = $GatewayTolerancePercent
+        }
+
+        Write-Host ""
+        Write-Host "===== part-6-2: 게이트웨이 엣지 rate limit (어뷰저 컷) =====" -ForegroundColor Magenta
+
+        $summary = Read-K6Summary -SummaryName $summaryName
+        if (-not $summary) {
+            Write-Host "  요약 JSON 을 읽지 못해 자동 판정을 건너뜁니다. 위 k6 출력을 직접 보세요." -ForegroundColor Yellow
+            $script:ExitCode = 1
+            return
+        }
+
+        $m = $summary.metrics
+        $abuserPassed = [int]$m.abuser_passed.count
+        $abuserBlocked = [int]$m.abuser_blocked.count
+        $abuserFailed = [int]$m.abuser_failed.count
+        $normalPassed = [int]$m.normal_passed.count
+        $normalBlocked = [int]$m.normal_blocked.count
+        $normalFailed = [int]$m.normal_failed.count
+        $dropped = if ($m.dropped_iterations) { [int]$m.dropped_iterations.count } else { 0 }
+
+        $abuserSent = $abuserPassed + $abuserBlocked + $abuserFailed
+        $normalSent = $normalPassed + $normalBlocked + $normalFailed
+
+        $expectedAbuser = $RateLimitBurst + $RateLimitReplenish * $seconds
+        $expectedNormal = $NormalRate * $seconds
+        $lower = [math]::Floor($expectedAbuser * (100 - $GatewayTolerancePercent) / 100)
+        $upper = [math]::Ceiling($expectedAbuser * (100 + $GatewayTolerancePercent) / 100)
+        $normalLower = [math]::Floor($expectedNormal * (100 - $GatewayTolerancePercent) / 100)
+
+        Write-Host ("  어뷰저(1명) 통과 = {0} / {1}  (차단 {2}, 실패 {3})" -f $abuserPassed, $abuserSent, $abuserBlocked, $abuserFailed)
+        Write-Host ("  정상 사용자 통과 = {0} / {1}  (차단 {2}, 실패 {3})" -f $normalPassed, $normalSent, $normalBlocked, $normalFailed)
+        Write-Host ("  dropped_iterations = {0}" -f $dropped)
+
+        # 부하가 실제로 안 나갔으면 나머지 숫자는 읽지 않는다
+        # (CLAUDE.md: checks 가 100% 가 아니면 나머지 숫자는 읽지 않는다 — 같은 취지).
+        Write-Host ""
+        if ($dropped -gt 0) {
+            Write-Host "FAIL: k6 이 ${dropped}건을 발사하지 못했습니다. 이 실행은 판정에 쓸 수 없습니다." -ForegroundColor Red
+            Write-Host "   VU 가 모자라 요청이 예정대로 안 나간 것이라, 통과/차단 수가 한도를 뜻하지 않습니다." -ForegroundColor DarkGray
+            $script:ExitCode = 1
+            return
+        }
+
+        if ($abuserFailed -gt 0 -or $normalFailed -gt 0) {
+            Write-Host "FAIL: 200/429 가 아닌 응답이 섞였습니다 (어뷰저 $abuserFailed, 정상 $normalFailed)." -ForegroundColor Red
+            Write-Host "   게이트웨이 뒤(coupon-service)나 라우트가 깨진 것입니다 — 한도 문제가 아닙니다." -ForegroundColor DarkGray
+            Write-Host "   docker compose logs gateway coupon-service 로 확인하세요." -ForegroundColor DarkGray
+            $script:ExitCode = 1
+            return
+        }
+
+        $verdicts = @()
+        if ($normalBlocked -ne 0) {
+            $verdicts += "정상 사용자가 ${normalBlocked}건 막혔습니다 — 버킷이 사용자별이 아니라 전역입니다 (KeyResolver 를 의심)"
+        }
+        if ($abuserBlocked -le 0) {
+            $verdicts += "어뷰저가 한 번도 안 막혔습니다 — 라우트에 RequestRateLimiter 가 안 붙었습니다"
+        }
+        if ($abuserPassed -lt $lower -or $abuserPassed -gt $upper) {
+            $verdicts += "어뷰저 통과가 ${abuserPassed}건입니다 — 기대 ${expectedAbuser}건, 허용 ${lower}~${upper}건"
+        }
+        if ($normalPassed -lt $normalLower) {
+            $verdicts += "정상 통과가 ${normalPassed}건입니다 — 기대 ${expectedNormal}건, 최소 ${normalLower}건"
+        }
+
+        if ($verdicts.Count -eq 0) {
+            Write-Host "PASS: 어뷰저는 한도(${expectedAbuser}건, 허용 ${lower}~${upper}건)만큼만 통과하고 정상 사용자는 한 번도 안 막혔습니다" -ForegroundColor Green
+        }
+        else {
+            Write-Host "FAIL:" -ForegroundColor Red
+            foreach ($v in $verdicts) { Write-Host "   - $v" -ForegroundColor Red }
+            $script:ExitCode = 1
+        }
+
+        Write-Host ""
+        Write-Host "  한도는 토큰 버킷이다 — 순간 ${RateLimitBurst}개를 먼저 쓰고, 그 뒤로는 초당 ${RateLimitReplenish}개만 채워진다." -ForegroundColor DarkGray
+        Write-Host "  어뷰저가 아무리 세게 때려도 서버에 닿는 것은 그만큼뿐이고, 나머지는 앱 앞에서 429 로 끝난다." -ForegroundColor DarkGray
+    }
+    finally {
+        Stop-Gateway -Announce
+    }
+}
+
 $script:ExitCode = 0
 
 switch ($Mode) {
@@ -644,6 +952,7 @@ switch ($Mode) {
     'single' { Invoke-WaitingRoomMode -Which 'single' }
     'scale' { Invoke-WaitingRoomMode -Which 'scale' }
     'journey' { Invoke-JourneyMode }
+    'gateway' { Invoke-GatewayMode }
 }
 
 Write-Host ""
