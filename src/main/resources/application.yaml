@@ -50,6 +50,11 @@ coupon:
     interval-ms: ${COUPON_RECONCILE_INTERVAL_MS:60000}
     # 발급 시각 WINDOW 상한 여유분. 방금 발급 된 DB가 아직 안 따라온 쿠폰은 CUTOFF(NOW - GRACE)
     grace-period-ms: ${COUPON_RECONCILE_GRACE_PERIOD_MS:10000}
+  waiting-room:
+    # 1초마다 통과 시키는 인원
+    admit-per-second: ${COUPON_WAITING_ROOM_ADMIT_PER_SECOND:100}
+    # 입장권 유효 시간(ms) - 3초
+    pass-ttl-ms: ${COUPON_WAITING_ROOM_PASS_TTL_MS:30000}
 
 logging:
   level:

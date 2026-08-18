@@ -12,6 +12,8 @@ Spring Boot 4.1 / Kotlin / MySQL / Redis, 부하 테스트는 k6.
 거기서 얻은 것을 개념으로 정리한 것은 [`docs/learning-notes.md`](docs/learning-notes.md).
 정합성(대사) 트랙은 숫자를 안 재고 PASS/FAIL 만 내므로 절 번호 밖에 따로 있다 —
 [`docs/consistency-track.md`](docs/consistency-track.md) (검증 항목 + 밟은 함정 + 증상별 의심 순서).
+가용성(대기실) 트랙도 부하 조건이 달라 절 번호 밖이다 —
+[`docs/availability-track.md`](docs/availability-track.md) (전역 통과 속도 + 폴링 비용 + 증상별 의심 순서).
 
 ## 규칙
 
@@ -21,8 +23,10 @@ Spring Boot 4.1 / Kotlin / MySQL / Redis, 부하 테스트는 k6.
   선택한 태그는 `.env` 의 `COUPON_IMAGE_TAG` 에 기록되고 compose 가 읽는다.
 - **스크립트는 세 트랙으로 나뉜다.** `scripts/concurrency/` 는 정확성(과발급·중복발급),
   `scripts/response/` 는 응답시간(P99), `scripts/efficiency/` 는 같은 결과를 내는 비용
-  (DB 조회 횟수, 매진 후 헛도는 요청). 각 트랙 안에서 **mac 원본(bash)은 수정하지 않고**
-  Windows 판은 `<트랙>/windows/` 에 따로 둔다.
+  (DB 조회 횟수, 매진 후 헛도는 요청). 절 번호 밖에 두 트랙이 더 있다 —
+  `scripts/consistency/` 는 정합성(대사, PASS/FAIL),
+  `scripts/availability/` 는 가용성(대기실이 초당 몇 명을 통과시키는가 + PASS/FAIL).
+  각 트랙 안에서 **mac 원본(bash)은 수정하지 않고** Windows 판은 `<트랙>/windows/` 에 따로 둔다.
 - **부하 조건(rate, VU, USER_POOL)을 바꾸면 기존 측정 기록과 비교가 성립하지 않는다.**
   바꿔야 한다면 그 사실을 문서에 명시하고 전 구현을 다시 잰다.
 - **재려는 기능이 그 이미지에 들어 있는지 먼저 확인한다.** 태그가 맞아도 그 태그가
@@ -34,5 +38,7 @@ Spring Boot 4.1 / Kotlin / MySQL / Redis, 부하 테스트는 k6.
   - 정확성: `.\scripts\concurrency\windows\load-test.ps1 <over_issuance|duplicate_issuance>`
   - 응답시간: `.\scripts\response\windows\run.ps1` (워밍업 1회 + 본 측정 1회)
   - 효율: `.\scripts\efficiency\windows\run.ps1` (`-Scenario policy|sellout`, 워밍업 1회 + 본 측정 1회)
+  - 가용성(대기실): `.\scripts\availability\windows\run.ps1 [baseline|single|scale|verify|journey]`
+    (인자 없으면 소스 단계 자동 감지. 부하 조건이 다른 트랙과 다르다 — 1,000/s × 20s, 재고 100만)
 - k6 결과에서 `checks` 가 100% 가 아니면 나머지 숫자는 읽지 않는다. 특히 `connected (not status 0)`.
   응답시간·효율 트랙은 `status 0` 을 지연 분포에서 빼므로 `status_conn_error` 를 같이 읽는다.

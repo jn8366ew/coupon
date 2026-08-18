@@ -79,10 +79,14 @@ services:
       timeout: 5s
       retries: 20
 
-  coupon-service:
-    # 어떤 구현을 띄울지는 태그로 고른다 (naive / pessimistic / ...).
+  coupon-service: &coupon-service
+    # 어떤 구현을 띄울지는 태그로 고른다 (naive / pessimistic / lua / …).
     # 값은 .env 의 COUPON_IMAGE_TAG 에서 오고, build-and-run 스크립트가 써 준다.
     # compose 가 .env 를 자동으로 읽으므로 어느 셸에서 실행하든 같은 태그가 적용된다.
+    #
+    # 여기를 coupon-service:latest 로 고정하면 안 된다. .env 에 새 태그를 써도 compose 는
+    # 계속 latest(= 5일 전 naive 이미지)를 띄우고, 빌드는 성공했는데 재는 것은 예전 구현인
+    # 상태가 된다 — 실제로 한 번 그랬다.
     image: coupon-service:${COUPON_IMAGE_TAG:-latest}
     depends_on:
       mysql:
@@ -91,28 +95,39 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-    environment:
+    environment: &coupon-env
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/coupon
       SPRING_DATASOURCE_USERNAME: coupon
       SPRING_DATASOURCE_PASSWORD: coupon
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      # stamped 데모 기본값은 1초. 셀에서 COUPON_CACHE_TTL_MS=10000으로 오버라이드 가능함
+      # stampede 데모 기본값 1초. 셸에서 COUPON_CACHE_TTL_MS=10000 으로 오버라이드 가능.
       COUPON_CACHE_TTL_MS: ${COUPON_CACHE_TTL_MS:-1000}
-      # issue 쿠폰 정보 조회의 seamped 차이를 보이기 위한 DB latency 시뮬레이션
+      # issue 쿠폰 정보 조회의 stampede 차이를 보이기 위한 DB latency 시뮬레이션.
       COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS: ${COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS:-100}
       COUPON_CACHE_FRESH_MS: ${COUPON_CACHE_FRESH_MS:-500}
-      # 대사 추가, 기본 1분. 검증 스크립트는 수동 트리거와 겹치지 않게 크게 오버라이드
+      # reconcile 배치 주기. 기본 1분. 검증 스크립트는 수동 트리거와 겹치지 않게 크게 오버라이드한다.
       COUPON_RECONCILE_INTERVAL_MS: ${COUPON_RECONCILE_INTERVAL_MS:-60000}
       # 대사가 훑는 발급 시각 창의 상한 여유분. 주기 대사 검증에서는 짧게 줘서
-      # 방금 낸 발급이 바로 창에 들어오게 한다
+      # 방금 낸 발급이 바로 창에 들어오게 한다.
       COUPON_RECONCILE_GRACE_PERIOD_MS: ${COUPON_RECONCILE_GRACE_PERIOD_MS:-10000}
       # issued_quantity write-behind 주기. part-5 대사 검증 때만 크게 줘서 사실상 끈다
-      # (켜져 있으면 issued_quantity 가 Redis 재고에서 파생돼 DB 측 드리프트가 항상 0)
+      # (켜져 있으면 issued_quantity 가 Redis 재고에서 파생돼 DB 측 드리프트가 항상 0).
+      # 이 줄이 없으면 consistency 트랙의 오버라이드가 조용히 안 먹는다.
       COUPON_SYNC_INTERVAL_MS: ${COUPON_SYNC_INTERVAL_MS:-1000}
+      # 통과 속도(기본 100/s). Redis 대기실이라 서버를 늘려도 유지된다.
+      COUPON_WAITING_ROOM_ADMIT_PER_SECOND: ${COUPON_WAITING_ROOM_ADMIT_PER_SECOND:-100}
+      COUPON_WAITING_ROOM_PASS_TTL_MS: ${COUPON_WAITING_ROOM_PASS_TTL_MS:-30000}
     ports:
       - "8080:8080"
+
+  # 통과 속도 유지 확인용 2번째 인스턴스. `docker compose --profile scale up -d` 로만 띄운다.
+  coupon-service-2:
+    <<: *coupon-service
+    profiles: [ "scale" ]
+    ports:
+      - "127.0.0.1:8081:8080"
 
 volumes:
   mysql-data:

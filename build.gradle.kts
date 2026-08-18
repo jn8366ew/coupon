@@ -35,6 +35,8 @@ dependencies {
 	implementation("tools.jackson.module:jackson-module-kotlin")
 	implementation("io.github.oshai:kotlin-logging-jvm:7.0.7")
 	implementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
+	implementation("net.javacrumbs.shedlock:shedlock-spring:6.6.0")
+	implementation("net.javacrumbs.shedlock:shedlock-provider-redis-spring:6.6.0")
 	runtimeOnly("com.mysql:mysql-connector-j")
 	testImplementation("org.springframework.boot:spring-boot-starter-data-jpa-test")
 	testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test")

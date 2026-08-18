@@ -435,13 +435,14 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 
 ## 6. 부하 테스트 하네스
 
-**하네스는 세 트랙이다.** 재는 것이 다르면 시나리오도 검증도 달라야 하기 때문이다.
+**하네스는 네 트랙이다.** 재는 것이 다르면 시나리오도 검증도 달라야 하기 때문이다.
 
 | 트랙 | 재는 것 | 한 줄 실행 |
 |---|---|---|
 | `scripts/concurrency/` | 정확성 — 과발급·중복발급·카운터 일치 | `.\scripts\concurrency\windows\load-test.ps1 <시나리오>` |
 | `scripts/response/` | 응답시간 — `issue_latency` 분포(P99), 부하 전달률 | `.\scripts\response\windows\run.ps1` |
 | `scripts/efficiency/` | 효율 — 같은 결과를 내는 비용(`couponDbReads`, 매진 후 헛도는 요청) | `.\scripts\efficiency\windows\run.ps1` |
+| `scripts/availability/` | 가용성 — 대기실이 초당 몇 명을 통과시키는가(전역 통과 속도) | `.\scripts\availability\windows\run.ps1 [모드]` |
 
 각 트랙 안에서 Windows 판은 `<트랙>/windows/`, mac 원본(bash + 로컬 k6)은 `<트랙>/load/` 또는
 트랙 루트에 있다. **mac 판은 수정하지 않는다.** 두 판본의 부하 조건(rate, VU, USER_POOL)이
@@ -453,6 +454,14 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 전부 NotStarted), ② 매진 후 새로고침은 4,000/s × 30s (재고 100 을 미리 매진시켜 둔다).
 그래서 이 트랙의 p99 는 다른 두 트랙의 p99 와 나란히 놓고 비교하면 안 된다.
 
+**availability 트랙도 조건이 따로다** — 1,000/s × 20s, 재고 1,000,000, 통과 속도 100/s, 허용 오차 ±30%.
+재고를 크게 잡은 이유는 매진이 나면 재는 대상이 "대기실" 이 아니라 "매진 처리" 로 바뀌기 때문이고,
+duration 이 20초인 이유는 입장권 TTL(30초)보다 짧아야 앞쪽 입장권이 만료되지 않기 때문이다.
+판정도 k6 이 아니라 Redis 에서 나온다 — 통과 인원 = 살아 있는 입장권 키(`waiting:{id}:pass<userId>`) 수.
+이 트랙만 `--profile scale` 로 2번째 인스턴스(`coupon-service-2`, `127.0.0.1:8081`)를 잠깐 띄운다.
+측정값과 해석은 [`availability-track.md`](availability-track.md) 에 있다
+(1회차: 진입 20,001건 → 통과 2,000건, 서버 2대에서도 100건/s 유지).
+
 ### 역할 분담
 
 | 스크립트 | 하는 일 |
@@ -462,6 +471,8 @@ UPDATE 를 요청 경로에 남겨 두었기 때문이다. 그 UPDATE 를 빼자
 | `response/windows/run.ps1` | 위와 같되 **워밍업 1회 + 본 측정 1회**, 검증은 드레인 폴링 |
 | `efficiency/windows/run.ps1` | 위와 같되 **시나리오 2종**(`-Scenario policy\|sellout`), 검증 대신 `/metrics/cache` 카운터 출력 |
 | `efficiency/windows/sell-out.ps1` | 100명 순차 발급 → Redis 재고가 0 이 될 때까지 폴링. 매진 안 되면 멈춘다 |
+| `availability/windows/run.ps1` | 위와 같되 모드 5종(`baseline`/`single`/`scale`/`verify`/`journey`). 판정은 Redis 입장권 수 |
+| `availability/windows/verify.ps1` | 대기실 순번·멱등성·통과·발급·게이트 8항목 PASS/FAIL (숫자를 재지 않는다) |
 | `<트랙>/windows/reset.ps1` | `coupon` / `issuance` TRUNCATE + Redis `FLUSHALL` |
 | `<트랙>/windows/create-coupon.ps1` | 쿠폰 1개 생성하고 ID 를 표준출력으로 반환 |
 | `concurrency/windows/verify.ps1` | 판정 SQL 실행 → 과발급/카운터 일치 여부 출력 |
@@ -570,6 +581,22 @@ docker compose exec redis redis-cli GET coupon:1:stock
 왜 죽었는지 안 나온다. 그래서 러너는 라운드에 들어가기 **전에** 기능을 직접 확인하고,
 없으면 빌드 커맨드를 안내하고 멈춘다.
 
+**`docker-compose.yml` 의 `coupon-service.image` 를 고정 태그로 바꾸지 않는다.**
+`build-and-run.ps1` 은 `.env` 에 `COUPON_IMAGE_TAG` 를 쓸 뿐이고, 그것을 읽는 쪽은 compose 다.
+강의 compose 를 가져오면서 이 줄이 `coupon-service:latest` 로 덮인 적이 있는데,
+그러면 `-Tag waiting-room` 으로 빌드해도 실제로 뜨는 것은 `latest`(= 5일 전 `naive` 이미지)다.
+**빌드도 성공하고 스크립트도 성공하는데 재는 것만 예전 구현인**, 화면에 아무 경고도 안 뜨는 상태다.
+실제로 가용성 트랙 첫 실행에서 이렇게 됐고, 러너의 기능 프로브가 아니었으면 그대로 쟀을 것이다.
+그래서 `availability/windows/run.ps1` 과 `verify.ps1` 은 프로브가 실패하면
+`.env` 태그와 `docker inspect` 로 읽은 실제 이미지를 나란히 찍는다.
+
+**대조군 측정은 그 반대다 — 기능이 "없는" 이미지를 요구한다.** 가용성 트랙의 `baseline` 은
+대기실을 붙이기 전을 재는데, 대기실이 든 이미지로 돌리면 발급 요청이 전부 403 으로 튕겨
+**처리량이 아니라 거절 속도를 잰다.** k6 은 정상 종료하고 `http_reqs` 도 20,001 로 그럴듯하게
+찍히므로 화면만 봐서는 모른다 (실제로 한 번 그랬다 —
+[`availability-track.md` §3.7](availability-track.md)). 그래서 프로브의 기대 방향을
+모드마다 반대로 두고, 어긋나면 리셋 전에 멈춘다. **새 모드를 만들 때 이 방향을 먼저 정할 것.**
+
 **빌드는 러너가 하지 않는다.** `build-and-run.ps1` 몫이다 — 태그 이름은 사람이 고를 일이고,
 예전 태그로 되돌아갈 때 `-NoBuild` 를 빼먹으면 그 이미지가 덮이기 때문이다(위 항목).
 새 기능을 재는 트랙을 만들 때는 **새 태그로 빌드해야 한다는 것 자체가 사전 조건**이므로
@@ -622,6 +649,18 @@ docker compose logs coupon-service | Select-String 'CouponService|KafkaErrorHand
 [Console]::OutputEncoding=[Text.Encoding]::UTF8                            # 또는 인코딩을 맞춘다 (그 세션 한정)
 ```
 
+**PowerShell 문자열에서 변수 뒤에 한글이 바로 붙으면 `${}` 로 감싼다.** 한글은 PowerShell 의
+식별자 문자라, `"$AdmitPerSecond건/s"` 는 `$AdmitPerSecond건` 이라는 변수 하나로 읽힌다.
+그런 변수는 없으므로 **에러 없이 숫자만 사라진다** — 실제로 `통과 속도 = /s`,
+`허용 70~/s` 로 찍혔다(`$lower~$upper` 에서 `$lower` 는 `~` 가 이름을 끊어 줘 살아남았다).
+`"{0}건/s" -f $x` 처럼 포맷 연산자를 쓰면 애초에 안 걸린다.
+
+**`docker` 의 출력을 `2>&1` 로 합쳐 버릴 때는 그 구간만 `$ErrorActionPreference` 를 내린다.**
+`docker compose` 는 진행 상황(`Container … Stopping`)을 stderr 로 쓰는데, `2>&1` 로 합치면
+PowerShell 5.1 이 그것을 ErrorRecord 로 감싸고 `'Stop'` 에서 `NativeCommandError` 로 올린다.
+**정상 종료가 빨간 실패로 보인다.** `availability/windows/run.ps1` 의 `Stop-SecondInstance` 가
+호출 동안만 `Continue` 로 내렸다가 `finally` 로 되돌리는 형태다.
+
 **새로 만드는 `.ps1` 에는 UTF-8 BOM 을 붙인다.** PowerShell 5.1 은 BOM 이 없으면 파일을
 시스템 코드페이지(한국어 Windows 면 CP949)로 읽어 한글 주석이 깨지고, 운이 나쁘면
 따옴표가 어긋나 **파싱 에러**가 난다. 기존 스크립트가 전부 BOM 을 달고 있는 이유다.
@@ -636,6 +675,11 @@ docker compose logs coupon-service | Select-String 'CouponService|KafkaErrorHand
 이 저장소에 없는 경로(`scripts/load/part-4/…`)를 참조한다 — 강의 원본 레이아웃이다.
 **새 트랙을 옮길 때 경로를 가장 먼저 의심할 것.** 전 요청이 404 여도 k6 은 정상 종료하므로,
 `route exists (not 404)` check 가 없으면 "결함 없음" 이라는 정반대 결론이 나온다.
+`scripts/availability/` 의 원본은 여기에 더해 **패키지 이름까지 다르다** — 기능 유무를
+`com/apiece/coupon/…/RedisWaitingRoom.kt` 로 판정하는데 이 저장소는 `com/example` 이라
+그대로 두면 모든 모드가 조용히 `baseline` 으로 떨어진다. Redis 키도 마찬가지다:
+원본의 스캔 패턴 `waiting:{id}:pass:*` 는 실제 키(`waiting:{id}:pass<userId>`, 구분자 없음)에
+한 건도 안 걸려 통과 인원이 항상 0 으로 나온다.
 
 **k6 컨테이너에는 `./scripts` 를 통째로 마운트한다.** 트랙별 하위 디렉터리를 각각 마운트하면
 디렉터리를 옮길 때마다 조용히 깨진다 — 실제로 한 번 깨졌다. 없는 호스트 경로를 마운트하면
