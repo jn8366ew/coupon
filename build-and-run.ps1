@@ -95,8 +95,13 @@ else {
     # 새 이미지로 옮겨간다. 구현을 비교하려고 태그를 나누는 건데 기준을 잃게 된다.
     #
     # tar 경로도 태그별로 나눈다. 기본값(build/jib-image.tar)을 쓰면 매번 덮어쓴다.
+    #
+    # 태스크명 앞의 `:` 는 루트 프로젝트만 가리킨다. 빼면 안 된다 — settings.gradle.kts 가
+    # gateway 를 include 하고 gateway 에도 jib 플러그인이 붙어 있어서, 경로 없는 jibBuildTar 는
+    # 서브프로젝트에서도 돈다. 그러면 아래 -Djib.to.image=coupon-service:$Tag 가 게이트웨이
+    # 빌드에까지 먹는다 (게이트웨이 이미지는 :gateway:jibBuildTar 로 따로 만든다).
     Invoke-Step "이미지 tar 빌드 (jibBuildTar) — coupon-service:$Tag" {
-        .\gradlew.bat jibBuildTar `
+        .\gradlew.bat :jibBuildTar `
             "-Djib.to.image=coupon-service:$Tag" `
             "-Djib.to.tags=$Tag" `
             "-Djib.outputPaths.tar=build/jib-$Tag.tar" `

@@ -15,13 +15,21 @@ import org.springframework.transaction.annotation.Transactional
  * 그 값과 "DB 에 실제로 들어간 issuance 행 수" 를 비교하게 되어,
  * 두 저장소가 어긋나면 잡아내는 교차 검증이 된다.
  * (COUNT(*) 로 채우면 언제나 일치해 검증이 아무것도 못 잡는다.)
+ *
+ * 주기를 property 로 뺀 이유 — part-5 정합성 검증(대사)은 이 열을 반대 뜻으로 읽는다.
+ * 거기서는 "DB 가 아는 발급 수" 여야 하는데, 이 동기화기가 켜져 있으면
+ * issued_quantity = totalQuantity - stock 이 되어 대사의
+ *     dbDrift = totalQuantity - (issuedQuantity + stock)
+ * 가 항상 정확히 0 이 된다 — DB 측 불일치를 원리적으로 못 잡는다.
+ * 그래서 그 검증 동안만 주기를 크게 줘서 사실상 꺼 둔다
+ * (scripts/consistency/windows/run-v2.ps1 이 COUPON_SYNC_INTERVAL_MS 로 넘긴다).
  */
 @Component
 class IssuedQuantitySynchronizer(
     private val couponRepository: CouponRepository,
     private val couponIssuer: CouponIssuer,
 ) {
-    @Scheduled(fixedDelay = 1000)
+    @Scheduled(fixedDelayString = "\${coupon.sync.interval-ms}")
     @Transactional
     fun sync() {
         couponRepository.findAll().forEach { coupon ->

@@ -35,3 +35,13 @@ services:
       LOGGING_LEVEL_ORG_HIBERNATE_SQL: WARN
       LOGGING_LEVEL_ORG_HIBERNATE_ORM_JDBC_BIND: WARN
       LOGGING_LEVEL_COM_EXAMPLE_COUPON: INFO
+
+  # 가용성 트랙의 scale 모드(서버 2대)에서 쓰는 2번째 인스턴스.
+  # 여기에 안 적으면 1번은 로그가 꺼지고 2번은 켜진 채로 돌아 두 대의 조건이 달라진다.
+  # base 의 profiles: ["scale"] 는 그대로라 평소 up -d 에는 뜨지 않는다.
+  coupon-service-2:
+    environment:
+      SPRING_JPA_SHOW_SQL: "false"
+      LOGGING_LEVEL_ORG_HIBERNATE_SQL: WARN
+      LOGGING_LEVEL_ORG_HIBERNATE_ORM_JDBC_BIND: WARN
+      LOGGING_LEVEL_COM_EXAMPLE_COUPON: INFO

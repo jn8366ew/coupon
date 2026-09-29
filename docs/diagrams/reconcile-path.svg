@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="600" viewBox="0 0 680 600" role="img">
+<title>Redis 와 DB 대사</title>
+<desc>주기 대사가 워터마크부터 최근 발급된 쿠폰을 골라 DB 측 불일치를 먼저 보고, 어긋나 있으면 알람만 내고 끝낸다. 맞으면 매진 플래그와 Redis 발급자 명단을 자동 보정하고 워터마크를 전진시킨다.</desc>
+<style>
+text{font-family:"Segoe UI","Malgun Gothic",sans-serif}
+.t{font-size:14px;fill:#2C2C2A}
+.ts{font-size:12px;fill:#5F5E5A}
+.th{font-size:14px;font-weight:500;fill:#2C2C2A}
+.box rect{fill:#F1EFE8;stroke:#888780;stroke-width:.5}
+.teal rect{fill:#E1F5EE;stroke:#0F6E56;stroke-width:.5}
+.teal .th,.teal .t{fill:#085041}
+.teal .ts{fill:#0F6E56}
+.purple rect{fill:#EEEDFE;stroke:#534AB7;stroke-width:.5}
+.purple .th,.purple .t{fill:#3C3489}
+.purple .ts{fill:#534AB7}
+.red rect{fill:#FCEBEB;stroke:#A32D2D;stroke-width:.5}
+.red .th,.red .t{fill:#791F1F}
+.red .ts{fill:#A32D2D}
+.arr{stroke:#5F5E5A;stroke-width:1.5;fill:none}
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="680" height="600" fill="#FFFFFF"/>
+
+<g class="box"><rect x="150" y="40" width="260" height="56" rx="8"/><text class="th" x="280" y="59" text-anchor="middle" dominant-baseline="central">주기 대사 (60초마다)</text><text class="ts" x="280" y="78" text-anchor="middle" dominant-baseline="central">워터마크 ~ 지금−10초</text></g>
+<line x1="280" y1="98" x2="280" y2="126" class="arr" marker-end="url(#arrow)"/>
+
+<g class="box"><rect x="150" y="130" width="260" height="56" rx="8"/><text class="th" x="280" y="149" text-anchor="middle" dominant-baseline="central">그 창에 발급된 쿠폰</text><text class="ts" x="280" y="168" text-anchor="middle" dominant-baseline="central">reconcile:recent ZSET</text></g>
+<line x1="280" y1="188" x2="280" y2="216" class="arr" marker-end="url(#arrow)"/>
+
+<g class="box"><rect x="150" y="220" width="260" height="56" rx="8"/><text class="th" x="280" y="239" text-anchor="middle" dominant-baseline="central">DB 측이 맞나</text><text class="ts" x="280" y="258" text-anchor="middle" dominant-baseline="central">총량 = DB 발급 수 + Redis 재고</text></g>
+<line x1="410" y1="248" x2="440" y2="248" class="arr" marker-end="url(#arrow)"/>
+<g class="red"><rect x="450" y="220" width="190" height="56" rx="8"/><text class="th" x="545" y="239" text-anchor="middle" dominant-baseline="central">어긋남 → 알람만</text><text class="ts" x="545" y="258" text-anchor="middle" dominant-baseline="central">아무것도 안 건드린다</text></g>
+<line x1="280" y1="278" x2="280" y2="306" class="arr" marker-end="url(#arrow)"/>
+
+<g class="teal"><rect x="150" y="310" width="260" height="56" rx="8"/><text class="th" x="280" y="329" text-anchor="middle" dominant-baseline="central">매진 플래그 보정</text><text class="ts" x="280" y="348" text-anchor="middle" dominant-baseline="central">재고와 플래그가 어긋나면 맞춘다</text></g>
+<line x1="280" y1="368" x2="280" y2="396" class="arr" marker-end="url(#arrow)"/>
+
+<g class="teal"><rect x="150" y="400" width="260" height="56" rx="8"/><text class="th" x="280" y="419" text-anchor="middle" dominant-baseline="central">발급자 명단 보정</text><text class="ts" x="280" y="438" text-anchor="middle" dominant-baseline="central">누락 = DB 발급자 − Redis 명단 → SADD</text></g>
+<line x1="410" y1="428" x2="440" y2="428" class="arr" marker-end="url(#arrow)"/>
+<g class="red"><rect x="450" y="400" width="190" height="56" rx="8"/><text class="th" x="545" y="419" text-anchor="middle" dominant-baseline="central">수가 안 맞으면 알람</text><text class="ts" x="545" y="438" text-anchor="middle" dominant-baseline="central">안전하게 못 고친다</text></g>
+<line x1="280" y1="458" x2="280" y2="486" class="arr" marker-end="url(#arrow)"/>
+
+<g class="box"><rect x="150" y="490" width="260" height="56" rx="8"/><text class="th" x="280" y="509" text-anchor="middle" dominant-baseline="central">워터마크 전진</text><text class="ts" x="280" y="528" text-anchor="middle" dominant-baseline="central">다 훑은 뒤에만</text></g>
+
+<text class="ts" x="40" y="580">teal = 스스로 고치는 자리 · red = 사람에게 넘기는 자리 (DB 에 없는 발급을 만들면 과발급이다)</text>
+</svg>

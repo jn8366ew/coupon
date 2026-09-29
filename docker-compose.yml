@@ -16,24 +16,6 @@ services:
       timeout: 3s
       retries: 20
 
-  coupon-service:
-    # 어떤 구현을 띄울지는 태그로 고른다 (naive / pessimistic / ...).
-    # 값은 .env 의 COUPON_IMAGE_TAG 에서 오고, build-and-run 스크립트가 써 준다.
-    # compose 가 .env 를 자동으로 읽으므로 어느 셸에서 실행하든 같은 태그가 적용된다.
-    image: coupon-service:${COUPON_IMAGE_TAG:-latest}
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/coupon
-      SPRING_DATASOURCE_USERNAME: coupon
-      SPRING_DATASOURCE_PASSWORD: coupon
-      SPRING_DATA_REDIS_HOST: redis
-      SPRING_DATA_REDIS_PORT: 6379
-    ports:
-      - "8080:8080"
 
   # 부하 테스트 러너. profile 덕분에 `docker compose up -d` 로는 뜨지 않고,
   # `docker compose run --rm k6 ...` 로 명시 실행할 때만 뜬다.
@@ -70,6 +52,116 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+
+  kafka:
+    # apache/kafka 공식 이미지는 KRaft 구성을 전제로 설계돼 있어서, ZooKeeper 컨테이너를 따로 띄우지 않는다.
+    image: apache/kafka:3.8.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:9094
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9094:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  coupon-service: &coupon-service
+    # 어떤 구현을 띄울지는 태그로 고른다 (naive / pessimistic / lua / …).
+    # 값은 .env 의 COUPON_IMAGE_TAG 에서 오고, build-and-run 스크립트가 써 준다.
+    # compose 가 .env 를 자동으로 읽으므로 어느 셸에서 실행하든 같은 태그가 적용된다.
+    #
+    # 여기를 coupon-service:latest 로 고정하면 안 된다. .env 에 새 태그를 써도 compose 는
+    # 계속 latest(= 5일 전 naive 이미지)를 띄우고, 빌드는 성공했는데 재는 것은 예전 구현인
+    # 상태가 된다 — 실제로 한 번 그랬다.
+    image: coupon-service:${COUPON_IMAGE_TAG:-latest}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment: &coupon-env
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/coupon
+      SPRING_DATASOURCE_USERNAME: coupon
+      SPRING_DATASOURCE_PASSWORD: coupon
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # stampede 데모 기본값 1초. 셸에서 COUPON_CACHE_TTL_MS=10000 으로 오버라이드 가능.
+      COUPON_CACHE_TTL_MS: ${COUPON_CACHE_TTL_MS:-1000}
+      # issue 쿠폰 정보 조회의 stampede 차이를 보이기 위한 DB latency 시뮬레이션.
+      COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS: ${COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS:-100}
+      COUPON_CACHE_FRESH_MS: ${COUPON_CACHE_FRESH_MS:-500}
+      # reconcile 배치 주기. 기본 1분. 검증 스크립트는 수동 트리거와 겹치지 않게 크게 오버라이드한다.
+      COUPON_RECONCILE_INTERVAL_MS: ${COUPON_RECONCILE_INTERVAL_MS:-60000}
+      # 대사가 훑는 발급 시각 창의 상한 여유분. 주기 대사 검증에서는 짧게 줘서
+      # 방금 낸 발급이 바로 창에 들어오게 한다.
+      COUPON_RECONCILE_GRACE_PERIOD_MS: ${COUPON_RECONCILE_GRACE_PERIOD_MS:-10000}
+      # issued_quantity write-behind 주기. part-5 대사 검증 때만 크게 줘서 사실상 끈다
+      # (켜져 있으면 issued_quantity 가 Redis 재고에서 파생돼 DB 측 드리프트가 항상 0).
+      # 이 줄이 없으면 consistency 트랙의 오버라이드가 조용히 안 먹는다.
+      COUPON_SYNC_INTERVAL_MS: ${COUPON_SYNC_INTERVAL_MS:-1000}
+      # 통과 속도(기본 100/s). Redis 대기실이라 서버를 늘려도 유지된다.
+      COUPON_WAITING_ROOM_ADMIT_PER_SECOND: ${COUPON_WAITING_ROOM_ADMIT_PER_SECOND:-100}
+      COUPON_WAITING_ROOM_PASS_TTL_MS: ${COUPON_WAITING_ROOM_PASS_TTL_MS:-30000}
+    ports:
+      # 측정 스크립트가 직접 붙는 포트. 운영이라면 publish 하지 않고
+      # Gateway 내부망(coupon-service:8080)으로만 연결한다.
+      - "8080:8080"
+
+  # 통과 속도 유지 확인용 2번째 인스턴스. `docker compose --profile scale up -d` 로만 띄운다.
+  coupon-service-2:
+    <<: *coupon-service
+    profiles: [ "scale" ]
+    ports:
+      - "127.0.0.1:8081:8080"
+
+  # API 관문(Spring Cloud Gateway). 어뷰저를 대기실 진입과 발급 앞에서 사용자별로 컷.
+  # 측정 트랙 5개는 8080 의 coupon-service 에 직접 붙으므로 이 서비스를 거치지 않는다.
+  #
+  # profile 을 붙인 것은 강의 원본과 다른 점이다. 두 가지 이유:
+  #   1. build-and-run.ps1 이 `docker compose up -d` 를 인자 없이 부른다. profile 이 없으면
+  #      coupon-gateway 이미지가 없을 때 pull 을 시도하다 실패해서 기동 전체가 죽는다.
+  #   2. 1,000/s 를 때리는 가용성 트랙 옆에서 게이트웨이가 같은 박스의 CPU 를 쓰면
+  #      기존 기준선과의 비교가 흔들린다. 뜨는 시점을 명시한다.
+  # 쓸 때: docker compose --profile gateway up -d
+  #
+  # 이미지 빌드(jibDockerBuild 는 교착에 빠진다 — docs/jib-docker-build-troubleshooting.md):
+  #   .\gradlew.bat :gateway:jibBuildTar
+  #   docker load -i gateway\build\jib-image.tar
+  gateway:
+    image: coupon-gateway:latest
+    profiles: ["gateway"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      coupon-service:
+        condition: service_started
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      COUPON_SERVICE_URI: http://coupon-service:8080
+      # 한 사용자는 초당 5번, 순간 최대 10번까지. 셸에서 오버라이드 가능.
+      # .env 에 넣으면 안 된다 — build-and-run.ps1 이 .env 를 통째로 덮어쓴다.
+      RATE_LIMIT_REPLENISH: ${RATE_LIMIT_REPLENISH:-5}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-10}
+    ports:
+      - "8090:8080"
 
 volumes:
   mysql-data:

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="410" viewBox="0 0 680 410" role="img">
+<title>Redis 와 MySQL 의 역할 분담</title>
+<desc>Redis 가 재고·중복·매진 판정의 진실을 쥐고 MySQL 은 발급 기록과 파생 카운터를 보관하며, IssuedQuantitySynchronizer 가 1초마다 Redis 재고에서 issued_quantity 를 계산해 덮어쓰는 구조.</desc>
+<style>
+text{font-family:"Segoe UI","Malgun Gothic",sans-serif}
+.t{font-size:14px;fill:#2C2C2A}
+.ts{font-size:12px;fill:#5F5E5A}
+.th{font-size:14px;font-weight:500;fill:#2C2C2A}
+.box rect{fill:#F1EFE8;stroke:#888780;stroke-width:.5}
+.teal rect{fill:#E1F5EE;stroke:#0F6E56;stroke-width:.5}
+.teal .th,.teal .t{fill:#085041}
+.teal .ts{fill:#0F6E56}
+.arr{stroke:#5F5E5A;stroke-width:1.5;fill:none}
+.dash{fill:none;stroke:#888780;stroke-width:.5;stroke-dasharray:4 4}
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="680" height="410" fill="#FFFFFF"/>
+
+<rect x="40" y="60" width="270" height="200" rx="8" class="dash"/>
+<text class="th" x="56" y="80" dominant-baseline="central">Redis — 판정의 진실</text>
+<g class="teal"><rect x="56" y="96" width="238" height="44" rx="4"/><text class="t" x="175" y="118" text-anchor="middle" dominant-baseline="central">coupon:{id}:stock</text></g>
+<g class="teal"><rect x="56" y="148" width="238" height="44" rx="4"/><text class="t" x="175" y="170" text-anchor="middle" dominant-baseline="central">coupon:{id}:users</text></g>
+<g class="teal"><rect x="56" y="200" width="238" height="44" rx="4"/><text class="t" x="175" y="222" text-anchor="middle" dominant-baseline="central">coupon:{id}:sold_out</text></g>
+
+<rect x="370" y="60" width="270" height="200" rx="8" class="dash"/>
+<text class="th" x="386" y="80" dominant-baseline="central">MySQL — 뒤따르는 기록</text>
+<g class="box"><rect x="386" y="96" width="238" height="56" rx="4"/><text class="th" x="505" y="115" text-anchor="middle" dominant-baseline="central">issuance</text><text class="ts" x="505" y="134" text-anchor="middle" dominant-baseline="central">UNIQUE (user_id, coupon_id)</text></g>
+<g class="box"><rect x="386" y="170" width="238" height="56" rx="4"/><text class="th" x="505" y="189" text-anchor="middle" dominant-baseline="central">coupon.issued_quantity</text><text class="ts" x="505" y="208" text-anchor="middle" dominant-baseline="central">파생 값 · 1초 뒤따라온다</text></g>
+
+<line x1="175" y1="262" x2="175" y2="296" class="arr" marker-end="url(#arrow)"/>
+<path d="M 505 300 L 505 266" class="arr" marker-end="url(#arrow)"/>
+
+<g class="box"><rect x="150" y="300" width="380" height="56" rx="8"/><text class="th" x="340" y="319" text-anchor="middle" dominant-baseline="central">IssuedQuantitySynchronizer</text><text class="ts" x="340" y="338" text-anchor="middle" dominant-baseline="central">1초마다 Redis 재고 → issued_quantity</text></g>
+
+<text class="ts" x="40" y="386">teal = 재고·중복·매진의 진실이 사는 곳</text>
+</svg>

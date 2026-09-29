@@ -120,6 +120,7 @@ function Invoke-Round {
 
     # k6 은 threshold(p(99)<500)가 깨지면 exit 99 를 낸다. 동기 구현에서는 깨지는 것이
     # 정상이고, 그게 이 트랙의 출발점이다. 여기서 멈추면 검증까지 못 간다.
+    # 다만 exit 99 를 판정 근거로 쓰지는 않는다 — 아래 "threshold 판정" 블록 참고.
     #
     # 왜 --no-deps 인가
     #   k6 서비스에는 depends_on: coupon-service 가 걸려 있다. 그대로 두면 compose 가
@@ -133,10 +134,53 @@ function Invoke-Round {
             /scripts/response/windows/k6/issue_burst.js
     }
 
-    if ($LASTEXITCODE -eq 99) {
-        Write-Host ""
-        Write-Host "k6 threshold 미달 (exit 99) — p(99)<500 이 깨졌습니다." -ForegroundColor Yellow
+    $k6ExitCode = $LASTEXITCODE
+
+    # ---------------------------------------------------------------------
+    # threshold 판정 — 종료 코드가 아니라 방금 쓴 요약 JSON 을 읽는다
+    #
+    # k6 의 종료 코드만으로는 판정을 믿을 수 없다. p(99)=5.62ms, max=46.59ms 인 실행이
+    # "thresholds have been crossed" 를 찍고 exit 99 로 끝난 적이 있다. 그 분포로는
+    # 어떤 시점에도 500ms 를 넘길 수 없으므로 종료 코드 쪽이 틀린 것이다. 원인은 모른다.
+    # (음수 duration 샘플(min < 0)을 의심했으나 아니었다 — 음수가 섞였는데 exit 0 인 실행도 있다.)
+    #
+    # 요약 JSON 의 metrics.<이름>.thresholds 값은 "넘겼다(true) / 통과(false)" 다.
+    # lua-pool(p(99)=705ms)이 true, queue-mem/async(5.6ms)가 false 인 것으로 확인했다.
+    # ---------------------------------------------------------------------
+    $summaryPath = Join-Path 'build\k6' $summaryName
+    $crossed = @()
+    $summaryRead = $false
+
+    if (Test-Path -LiteralPath $summaryPath) {
+        try {
+            $thresholds = (Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json).metrics.issue_latency.thresholds
+            if ($thresholds) {
+                $crossed = @($thresholds.PSObject.Properties | Where-Object { $_.Value } | ForEach-Object { $_.Name })
+                $summaryRead = $true
+            }
+        }
+        catch {
+            # 판정을 못 읽는다고 측정을 막지는 않는다. 수치 자체는 화면에 이미 나와 있다.
+            Write-Host "  (요약 JSON 을 읽지 못해 threshold 판정을 건너뜁니다: $($_.Exception.Message))" -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ""
+    if (-not $summaryRead) {
+        Write-Host "threshold 판정: 확인 불가 (요약 JSON 없음)" -ForegroundColor DarkGray
+    }
+    elseif ($crossed.Count -gt 0) {
+        Write-Host "threshold 미달: $($crossed -join ', ')" -ForegroundColor Yellow
         Write-Host "  동기 구현에서는 예상된 결과입니다. 측정값은 그대로 읽고 진행합니다." -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "threshold 통과" -ForegroundColor Green
+
+        # 여기가 이 블록을 만든 이유다. 둘이 어긋나면 요약 JSON 쪽을 믿는다.
+        if ($k6ExitCode -eq 99) {
+            Write-Host "  주의: k6 은 exit 99(threshold crossed)로 끝났는데 요약 JSON 은 통과입니다." -ForegroundColor Yellow
+            Write-Host "        요약 JSON 을 신뢰하세요 (원인 미확정 — scripts\response\windows\README.md 3번)." -ForegroundColor DarkGray
+        }
     }
 
     Write-Host ""

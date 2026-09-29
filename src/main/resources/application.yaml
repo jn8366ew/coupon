@@ -24,6 +24,37 @@ spring:
   mvc:
     problemdetails:
       enabled: true
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+
+coupon:
+  cache:
+    # 쿠폰 캐시 TTL. stampede 측정 시 1000 (1초) 으로 오버라이드.
+    ttl-ms: ${COUPON_CACHE_TTL_MS:10000}
+    # SWR fresh window, 캐시를 최신으로 보는 시간, ttl-ms보다 짧게. 이 안: 즉시 반환, 넘으면 stale + 백그라운드 갱신.
+    fresh-ms: ${COUPON_CACHE_FRESH_MS:500}
+    # loader latency (DB 조회 지연시간) 시뮬레이션. loader 안에서 Thread.sleep. 0=비활성.
+    simulated-load-latency-ms: ${COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS:0}
+  sold-out:
+    # 매진 플래그 Redis TTL (이벤트 종료까지 유지)
+    ttl-seconds: ${COUPON_SOLD_OUT_TTL_SECONDS:86400}
+    # Application fast-path (Caffeine) TTL. 매진 직후 이 시간만큼 실제 매진을 아직 모를 수 있다.
+    fast-path-ttl-ms: ${COUPON_SOLD_OUT_FAST_PATH_TTL_MS:1000}
+  sync:
+    # issued_quantity write-behind 반영 주기 (IssuedQuantitySynchronizer).
+    # part-5 정합성 검증은 크게 줘서 사실상 끈다 — 켜져 있으면 issued_quantity 가
+    # Redis 재고에서 파생돼 대사의 DB 측 드리프트가 구조적으로 항상 0 이 된다.
+    interval-ms: ${COUPON_SYNC_INTERVAL_MS:1000}
+  reconcile:
+    # 정합성 점검 배치 주기. 매 분 1회로 발급 시각 WINDOW 한칸의 너비
+    interval-ms: ${COUPON_RECONCILE_INTERVAL_MS:60000}
+    # 발급 시각 WINDOW 상한 여유분. 방금 발급 된 DB가 아직 안 따라온 쿠폰은 CUTOFF(NOW - GRACE)
+    grace-period-ms: ${COUPON_RECONCILE_GRACE_PERIOD_MS:10000}
+  waiting-room:
+    # 1초마다 통과 시키는 인원
+    admit-per-second: ${COUPON_WAITING_ROOM_ADMIT_PER_SECOND:100}
+    # 입장권 유효 시간(ms) - 3초
+    pass-ttl-ms: ${COUPON_WAITING_ROOM_PASS_TTL_MS:30000}
 
 logging:
   level:

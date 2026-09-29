@@ -49,10 +49,31 @@ p99 를 직접 오염시킨다 — 연결 거부는 `duration ≈ 0ms` 로 기�
 (`docs/load-test-k6.md` §12.7.3). 부하 모델을 닫힌 모델로 바꾸면 사라지는 문제지만,
 그러면 기존 측정 기록과 비교가 성립하지 않으므로 아직 바꾸지 않았다 (`docs/load-test-k6.md` §11).
 
-### 3. `issue_latency` threshold 는 깨지는 것이 정상이다
+### 3. threshold 판정은 exit 99 가 아니라 요약 JSON 으로 한다
 
-`p(99)<500` 은 큐 디커플링 이후를 기대한 값이다. 동기 구현에서 깨지는 것이 출발점이고,
-k6 은 이때 **exit 99** 를 낸다. `run.ps1` 이 99 를 허용 코드로 두고 검증까지 진행한다.
+`p(99)<500` 은 큐 디커플링 이후를 기대한 값이다. 동기 구현에서는 깨지고(정상), 큐 구현에서는
+통과한다. k6 은 깨지면 **exit 99** 를 내므로 `run.ps1` 이 99 를 허용 코드로 두고 검증까지 진행한다.
+
+**그런데 종료 코드가 틀린 적이 있다.**
+
+| 실행 | p(99) | max | 요약 JSON | 종료 코드 |
+|---|---:|---:|---|---|
+| `lua-pool` | 705ms | 871ms | 넘김 | 99 |
+| **`queue-mem`** | 5.62ms | **46.59ms** | **통과** | **99** |
+| `queue-async` | 5.59ms | 36.91ms | 통과 | 0 |
+
+`queue-mem` 은 최댓값이 46.59ms 라 **어떤 시점에도 500ms 를 넘길 수 없는** 분포인데
+k6 이 `thresholds have been crossed` 를 찍었다. **원인은 모른다.**
+`issue_latency` 의 `min` 이 음수로 나오는 것(컨테이너 클럭 문제로 보인다)을 의심했지만
+아니었다 — 음수가 섞였는데 exit 0 으로 끝난 실행도 있다.
+
+그래서 `run.ps1` 은 **요약 JSON 의 `metrics.issue_latency.thresholds` 를 읽어 판정한다**
+(값이 `true` 면 넘긴 것, `false` 면 통과). 둘이 어긋나면 그 사실을 화면에 알리고
+요약 JSON 쪽을 따른다. 직접 볼 때도 같은 기준으로 본다:
+
+```powershell
+(Get-Content -Raw build\k6\issue_burst-<태그>-steady.json | ConvertFrom-Json).metrics.issue_latency.thresholds
+```
 
 ### 4. 검증 출력
 
