@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="600" viewBox="0 0 680 600" role="img">
+<title>진입 제어 경로</title>
+<desc>요청이 게이트웨이 rate limit, 대기실 진입, 스케줄러의 입장권 발급, 발급 API 의 입장권 검사를 차례로 지나 발급 판정으로 넘어가는 흐름과 각 단계에서 갈라지는 429·대기·403 응답.</desc>
+<style>
+text{font-family:"Segoe UI","Malgun Gothic",sans-serif}
+.t{font-size:14px;fill:#2C2C2A}
+.ts{font-size:12px;fill:#5F5E5A}
+.th{font-size:14px;font-weight:500;fill:#2C2C2A}
+.box rect{fill:#F1EFE8;stroke:#888780;stroke-width:.5}
+.teal rect{fill:#E1F5EE;stroke:#0F6E56;stroke-width:.5}
+.teal .th,.teal .t{fill:#085041}
+.teal .ts{fill:#0F6E56}
+.purple rect{fill:#EEEDFE;stroke:#534AB7;stroke-width:.5}
+.purple .th,.purple .t{fill:#3C3489}
+.purple .ts{fill:#534AB7}
+.red rect{fill:#FCEBEB;stroke:#A32D2D;stroke-width:.5}
+.red .th,.red .t{fill:#791F1F}
+.red .ts{fill:#A32D2D}
+.arr{stroke:#5F5E5A;stroke-width:1.5;fill:none}
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="680" height="600" fill="#FFFFFF"/>
+
+<g class="box"><rect x="150" y="40" width="260" height="56" rx="8"/><text class="th" x="280" y="59" text-anchor="middle" dominant-baseline="central">사용자 요청</text><text class="ts" x="280" y="78" text-anchor="middle" dominant-baseline="central">X-User-Id 헤더</text></g>
+<line x1="280" y1="98" x2="280" y2="126" class="arr" marker-end="url(#arrow)"/>
+
+<g class="purple"><rect x="150" y="130" width="260" height="56" rx="8"/><text class="th" x="280" y="149" text-anchor="middle" dominant-baseline="central">① 게이트웨이 :8090</text><text class="ts" x="280" y="168" text-anchor="middle" dominant-baseline="central">토큰 버킷 · 사용자당 5/s, 순간 10</text></g>
+<line x1="410" y1="158" x2="440" y2="158" class="arr" marker-end="url(#arrow)"/>
+<g class="red"><rect x="450" y="130" width="190" height="56" rx="8"/><text class="th" x="545" y="149" text-anchor="middle" dominant-baseline="central">429</text><text class="ts" x="545" y="168" text-anchor="middle" dominant-baseline="central">앱까지 가지 않는다</text></g>
+<line x1="280" y1="188" x2="280" y2="216" class="arr" marker-end="url(#arrow)"/>
+
+<g class="teal"><rect x="150" y="220" width="260" height="56" rx="8"/><text class="th" x="280" y="239" text-anchor="middle" dominant-baseline="central">② 대기실 진입</text><text class="ts" x="280" y="258" text-anchor="middle" dominant-baseline="central">Lua · ZADD NX, Redis TIME 순</text></g>
+<line x1="410" y1="248" x2="440" y2="248" class="arr" marker-end="url(#arrow)"/>
+<g class="box"><rect x="450" y="220" width="190" height="56" rx="8"/><text class="th" x="545" y="239" text-anchor="middle" dominant-baseline="central">대기 중</text><text class="ts" x="545" y="258" text-anchor="middle" dominant-baseline="central">순번 · 예상 대기초 → 폴링</text></g>
+<line x1="280" y1="278" x2="280" y2="306" class="arr" marker-end="url(#arrow)"/>
+
+<g class="teal"><rect x="150" y="310" width="260" height="56" rx="8"/><text class="th" x="280" y="329" text-anchor="middle" dominant-baseline="central">③ 입장권 발급 (스케줄러)</text><text class="ts" x="280" y="348" text-anchor="middle" dominant-baseline="central">1초마다 앞 100명 · ShedLock</text></g>
+<line x1="410" y1="338" x2="440" y2="338" class="arr" marker-end="url(#arrow)"/>
+<g class="box"><rect x="450" y="310" width="190" height="56" rx="8"/><text class="th" x="545" y="329" text-anchor="middle" dominant-baseline="central">서버가 몇 대든</text><text class="ts" x="545" y="348" text-anchor="middle" dominant-baseline="central">한 대만 돈다 = 전역 100/s</text></g>
+<line x1="280" y1="368" x2="280" y2="396" class="arr" marker-end="url(#arrow)"/>
+
+<g class="box"><rect x="150" y="400" width="260" height="56" rx="8"/><text class="th" x="280" y="419" text-anchor="middle" dominant-baseline="central">④ POST /coupons/{id}/issue</text><text class="ts" x="280" y="438" text-anchor="middle" dominant-baseline="central">입장권이 있나 · TTL 30초</text></g>
+<line x1="410" y1="428" x2="440" y2="428" class="arr" marker-end="url(#arrow)"/>
+<g class="red"><rect x="450" y="400" width="190" height="56" rx="8"/><text class="th" x="545" y="419" text-anchor="middle" dominant-baseline="central">403</text><text class="ts" x="545" y="438" text-anchor="middle" dominant-baseline="central">NO_WAITING_ROOM_PASS</text></g>
+<line x1="280" y1="458" x2="280" y2="486" class="arr" marker-end="url(#arrow)"/>
+
+<g class="box"><rect x="150" y="490" width="260" height="56" rx="8"/><text class="th" x="280" y="509" text-anchor="middle" dominant-baseline="central">발급 판정으로</text><text class="ts" x="280" y="528" text-anchor="middle" dominant-baseline="central">02-issue 의 그림</text></g>
+
+<text class="ts" x="40" y="580">teal = 원자성이 보장되는 자리 · purple = 앱 밖에서 끊는 자리 · red = 거절</text>
+</svg>
