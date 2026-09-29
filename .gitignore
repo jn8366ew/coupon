@@ -17,6 +17,13 @@ out/
 # jib 이미지 tar(build/jib-*.tar)와 k6 요약 JSON(build/k6/*.json)은 위의 build/ 에서 이미 걸린다.
 HELP.md
 
+### 도구 로컬 상태 ###
+# Playwright MCP 가 브라우저 확인 때 남기는 스크린샷·로그
+.playwright-mcp/
+# Claude Code 개인 설정 (권한 허용 목록 등)
+.claude/settings.local.json
+*.log
+
 ### IntelliJ IDEA ###
 .idea/
 .idea_modules/
