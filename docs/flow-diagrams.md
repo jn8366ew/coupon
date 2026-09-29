@@ -38,9 +38,11 @@ Redis 서버 안에서 한 덩어리로 돈다. 왕복으로 나누면 그 틈�
 
 사용자는 이미 떠났고, `issuance` 행은 여기서 만들어진다.
 
-- **워커에는 `coupon` 행을 건드리는 쿼리가 없다.** 선착순이라 모든 발급이 그 단일 행을 향하고,
+- **워커에 `coupon` 단일 행 UPDATE 가 되돌아와 있다.** 선착순이라 모든 발급이 그 단일 행을 향하고,
   InnoDB 는 그 행의 UPDATE 를 직렬화하므로 어디에 있든 그것이 그 경로의 상한이 된다.
-  응답 경로에서 뺐다가(`lua-wb`) 워커 안으로 돌아왔고, 거기서도 뺐다(`kafka-nocount`).
+  응답 경로에서 뺐다가(`lua-wb`) 워커 안으로 돌아왔고, 거기서도 뺐는데(`kafka-nocount`)
+  dlt-replay 작업에서 다시 들어왔다 — 경위는 [`architecture.md`](architecture.md) §2 의 경고 박스.
+- **DLT 는 로그 테이블에 `PENDING` 으로 쌓이고**, 관리자가 `POST /admin/issuance/dlt/replay` 로 골라서 다시 발행한다.
 - **UNIQUE 위반은 삼킨다.** 중복은 결함이 아니라 재처리의 정상 결과이므로 예외를 밖으로 뱉으면
   워커가 같은 메시지를 영원히 다시 먹는다.
 - **DLT 로 가도 재고는 되돌리지 않는다.** 이유는 [`architecture.md`](architecture.md) §4 에 있다.

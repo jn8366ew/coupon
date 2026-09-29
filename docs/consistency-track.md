@@ -136,9 +136,14 @@ dbDrift = totalQuantity − (issued + stock)   // 대사
 **해결.** 지우지 않고 **검증 동안만 껐다.** 동기화 주기를 property 로 뺐다
 (`coupon.sync.interval-ms` / `COUPON_SYNC_INTERVAL_MS`, 기본 `1000`).
 
-지우면 안 되는 이유: `CouponRepository.incrementIssueQuantity` 는 호출자가 없으므로
-(그 파일 주석이 직접 밝혀 둔다) 동기화기가 이 열의 **유일한 기록자**다. 없애면
-`issued_quantity` 가 영원히 0 이 되어 정확성 트랙의 `count_match` 가 영구 FAIL 이 된다.
+지우면 안 되는 이유: 동기화기가 이 열을 **Redis 기준의 절대값으로 맞춰 주는 유일한 주체**다.
+없애면 정확성 트랙의 `count_match` 가 깨진다.
+
+> 예전에는 여기에 "`incrementIssueQuantity` 는 호출자가 없다" 고 적혀 있었다.
+> **지금은 호출자가 있다** — `IssuanceTransactionWriter` 가 다시 부른다(커밋 `2292479`).
+> 이 트랙의 검증에는 영향이 없다. 주기 대사 블록은 동기화기를 켜고(1000),
+> 워터마크 블록은 끄는 대신 `force-db-only.ps1` 이 `issued_quantity` 를 직접 맞춰 주기 때문이다.
+> 자세한 경위는 [`architecture.md`](architecture.md) §2 의 경고 박스.
 
 자세한 것은 [`architecture.md`](architecture.md) §2 의 함정 절.
 

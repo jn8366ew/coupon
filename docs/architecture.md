@@ -65,14 +65,26 @@ CouponController.issue
 
   ⤷ IssuanceWorker — @KafkaListener(concurrency=3), 컨슈머 3개가 파티션 하나씩
        └─ IssuanceWriter.write                UNIQUE 위반은 멱등 처리로 삼키고 넘어간다
-            └─ IssuanceTransactionWriter.insert               @Transactional
-                 └─ issuanceRepository.save                     INSERT issuance 뿐이다
+            └─ IssuanceTransactionWriter.insertAndIncrement    @Transactional
+                 ├─ issuanceRepository.save                     INSERT issuance
+                 └─ couponRepository.incrementIssueQuantity     UPDATE coupon (단일 행!)
 ```
 
-**워커에는 `coupon` 행을 건드리는 쿼리가 없다.** 예전에는 여기서 `incrementIssueQuantity` 를
-같이 쳤는데, 그 값은 `IssuedQuantitySynchronizer` 가 매초 덮어써서 결과에 기여하지 않으면서
-컨슈머들을 단일 행 락에 줄 세우기만 했다. 빼자 부하 종료 후 드레인이 통째로 사라졌다
-([`load-test-response.md` §16](load-test-response.md)).
+> **⚠ 이 `UPDATE` 는 한 번 걷어냈다가 되돌아온 것이다 — 알고 쓰는 것이 아니다.**
+>
+> `incrementIssueQuantity` 는 part-3-3-C(커밋 `d6832c5`)에서 **뺐었다.** 그 값은
+> `IssuedQuantitySynchronizer` 가 매초 절대값으로 덮어써서 결과에 기여하지 않으면서
+> 컨슈머들을 단일 행 락에 줄 세우기만 했고, 빼자 부하 종료 후 드레인이 통째로 사라졌다
+> ([`load-test-response.md` §16](load-test-response.md)). **병목이 그 한 줄이라는 확정이
+> 거기서 나왔다.**
+>
+> 그런데 dlt-replay 작업(커밋 `2292479`)에서 멱등 검사를 넣으며 **같이 되돌아왔다.**
+> 그 커밋 메시지에 이 줄 얘기는 없다. 지우려던 근거는 지금도 유효하지만
+> (동기화기는 여전히 절대값으로 덮어쓴다) 다시 빼면 앱 동작이 바뀌어 새 태그와 재측정이
+> 필요하므로, 지금은 사실만 기록해 두었다.
+>
+> **§16 이후의 응답시간·효율 수치는 "이 UPDATE 가 없다" 는 전제로 쓰였다.**
+> 2026-08-17 이후 이미지(`reconcile-*` · `waiting-room` · `gateway` …)는 있는 상태다.
 
 **판정은 Redis, 기록은 큐 뒤의 워커** 로 나뉘어 있는 것이 이 구조의 핵심이다.
 경합이 몰리는 자리(재고 차감, 1인 1매)는 전부 Redis 의 Lua 스크립트 안에 있고,
@@ -126,9 +138,13 @@ dbDrift = total − (total − stock) − stock = 0
 `scripts/consistency/windows/run-v2.ps1` 이 part-5-2 에서 `COUPON_RECONCILE_INTERVAL_MS` 와
 함께 `3600000` 으로 준다.
 
-지우면 안 되는 이유는 위 문단 그대로다 — `CouponRepository.incrementIssueQuantity` 는
-호출자가 없으므로(그 파일 주석이 직접 밝혀 둔다) 동기화기가 이 열의 **유일한** 기록자다.
-없애면 `issued_quantity` 가 영원히 0 이 되어 정확성 트랙의 `count_match` 가 영구 FAIL 이 된다.
+지우면 안 되는 이유는 위 문단 그대로다 — 동기화기를 없애면 `issued_quantity` 를
+Redis 기준으로 맞추는 주체가 사라져 정확성 트랙의 `count_match` 가 깨진다.
+
+(예전에는 "`incrementIssueQuantity` 는 호출자가 없으므로 동기화기가 **유일한** 기록자" 라고
+적어 두었는데, **지금은 호출자가 있다** — `IssuanceTransactionWriter` 가 다시 부른다. 위 §2 의
+경고 박스 참고. 기록자가 둘이 됐어도 결론은 같다: 워커의 `+1` 은 상대값이라 재고와
+어긋나기 시작하면 스스로 못 돌아오고, 절대값으로 맞춰 주는 쪽은 동기화기뿐이다.)
 
 **`issued_quantity` 를 근거로 뭔가 판정하기 전에 그 시점의 동기화 주기가 얼마인지 먼저 본다.**
 

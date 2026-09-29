@@ -21,7 +21,7 @@ text{font-family:"Segoe UI","Malgun Gothic",sans-serif}
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
 <rect x="0" y="0" width="680" height="590" fill="#FFFFFF"/>
 
-<g class="box"><rect x="150" y="40" width="260" height="56" rx="8"/><text class="th" x="280" y="59" text-anchor="middle" dominant-baseline="central">POST /coupons/{id}/issue</text><text class="ts" x="280" y="78" text-anchor="middle" dominant-baseline="central">요청 스레드 · 트랜잭션 없음</text></g>
+<g class="box"><rect x="150" y="40" width="260" height="56" rx="8"/><text class="th" x="280" y="59" text-anchor="middle" dominant-baseline="central">POST /coupons/{id}/issue</text><text class="ts" x="280" y="78" text-anchor="middle" dominant-baseline="central">입장권 확인 뒤 · 트랜잭션 없음</text></g>
 <line x1="280" y1="98" x2="280" y2="126" class="arr" marker-end="url(#arrow)"/>
 
 <g class="teal"><rect x="150" y="130" width="260" height="56" rx="8"/><text class="th" x="280" y="149" text-anchor="middle" dominant-baseline="central">① 매진 fast path</text><text class="ts" x="280" y="168" text-anchor="middle" dominant-baseline="central">Caffeine L1 · 미스만 Redis</text></g>

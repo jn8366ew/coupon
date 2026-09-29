@@ -523,8 +523,11 @@ function Invoke-ScheduledReconcile {
     #  - 대사 주기: 짧게. 기다려서 봐야 하므로.
     #  - grace: 짧게. 방금 낸 발급이 창(cutoff = now - grace) 안으로 바로 들어와야 한다.
     #  - 동기화기: 켠다(1000). 여기서는 dbDrift 가 0 이어야 사용자 보정 경로까지 들어간다.
-    #    꺼 두면 issued_quantity 가 0 으로 남아 dbDrift != 0 이 되고, 대사가 알람만 내고
-    #    early return 해 버려서(CouponReconciler.kt:32-34) 명단을 안 고친다.
+    #    꺼 두면 issued_quantity 가 Redis 재고와 무관하게 흘러 dbDrift != 0 이 되고,
+    #    대사가 알람만 내고 early return 해 버려서(CouponReconciler.kt:32-34) 명단을 안 고친다.
+    #    (이 줄은 원래 "꺼 두면 0 으로 남아" 였다. 워커의 incrementIssueQuantity 가
+    #     빠져 있던 시절의 서술이고, 커밋 2292479 로 되살아나 지금은 워커도 이 열을 쓴다.
+    #     끄면 안 된다는 결론은 같다 — docs/architecture.md §2 경고 박스.)
     # kafka 는 그대로 쓴다. 이 블록은 DLT 를 안 건드리므로 재생성할 이유가 없다.
     Restart-CouponService -ReconcileIntervalMs 5000 -GracePeriodMs 500 -SyncIntervalMs 1000 -SkipKafka
 

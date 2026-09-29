@@ -436,6 +436,17 @@ docker compose start kafka
 
 ## 16. 병목의 정체 — `kafka-nocount` (2026-08-15)
 
+> **⚠ 이 절의 전제는 지금 코드에서 참이 아니다.** 여기서 뺀 그 한 줄은
+> dlt-replay 작업(커밋 `2292479`, 2026-08-17)에서 멱등 검사를 넣으며 **되돌아왔다.**
+> 그 커밋 메시지에 이 줄 얘기는 없다 — 곁다리로 딸려온 것으로 보인다.
+>
+> **그래서 2026-08-17 이후 이미지**(`reconcile-*` · `waiting-room` · `gateway` …)**는
+> 이 절이 없앤 병목을 다시 갖고 있다.** 아래 §16.1~§16.4 의 관측과 "병목은 `coupon` 단일 행
+> UPDATE 였다" 는 결론 자체는 그대로 유효하다 — `kafka` 와 `kafka-nocount` 두 태그를
+> 비교해서 얻은 것이고 그 이미지들은 그대로 남아 있다.
+> 다만 **그 개선이 현재 코드에 반영돼 있다고 읽으면 안 된다.**
+> 경위는 [`architecture.md`](architecture.md) §2 의 경고 박스.
+
 14.6 에서 지목한 한 줄만 뺐다.
 `IssuanceTransactionWriter` 의 `couponRepository.incrementIssueQuantity(event.couponId)`.
 
